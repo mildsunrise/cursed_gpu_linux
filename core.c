@@ -29,27 +29,27 @@ uint32_t __core_dec_i(uint32_t instr) {
 }
 uint32_t __core_dec_j(uint32_t instr) {
     int32_t sign = ((int32_t)instr) & (1 << 31);
-    return (uint32_t)(sign >> 11) |
+    return (uint32_t)(sign >> 12) |
         (instr & (MASK(8) << 12)) |
         ((instr & (MASK(1) << 20)) >> 9) |
         ((instr & (MASK(10) << 21)) >> 20);
 }
 uint32_t __core_dec_b(uint32_t instr) {
     int32_t sign = ((int32_t)instr) & (1 << 31);
-    return (uint32_t)(sign >> 19) |
+    return (uint32_t)(sign >> 20) |
         ((instr & (MASK(4) << 8)) >> 7) |
         ((instr & (MASK(1) << 7)) << 4) |
         ((instr & (MASK(6) << 25)) >> 20);
 }
 uint32_t __core_dec_s(uint32_t instr) {
     int32_t sign = ((int32_t)instr) & (1 << 31);
-    return (uint32_t)(sign >> 19) |
+    return (uint32_t)(sign >> 20) |
         ((instr & (MASK(5) << 7)) >> 7) |
         ((instr & (MASK(6) << 25)) >> 20);
 }
 
 uint32_t __core_read_rs1(const core_t* core, uint32_t instr) {
-    return core->x_regs[(instr >> 7) & MASK(5)];
+    return core->x_regs[(instr >> 15) & MASK(5)];
 }
 uint32_t __core_read_rs2(const core_t* core, uint32_t instr) {
     return core->x_regs[(instr >> 20) & MASK(5)];
@@ -96,7 +96,7 @@ bool __core_jmp_op(core_t* core, uint32_t instr, uint32_t a, uint32_t b) {
 }
 
 void __core_set_dest(core_t* core, uint32_t instr, uint32_t x) {
-    uint32_t rd = (instr >> 15) & MASK(5);
+    uint32_t rd = (instr >> 7) & MASK(5);
     if (rd) core->x_regs[rd] = x;
 }
 
@@ -146,7 +146,7 @@ void core_step(core_t* core) {
 
         case RISCV_I_LOAD:
             uint32_t value;
-            core->mem_load(core, __core_read_rs1(core, instr) + __core_dec_s(instr), __core_dec_func3(instr), &value);
+            core->mem_load(core, __core_read_rs1(core, instr) + __core_dec_i(instr), __core_dec_func3(instr), &value);
             if (unlikely(core->error)) return;
             __core_set_dest(core, instr, value);
             break;
