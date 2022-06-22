@@ -123,6 +123,7 @@ void core_step(core_t* core) {
     core->pc += 4;
 
     uint32_t instr_opcode = instr & MASK(7);
+    uint32_t value;
     switch (instr_opcode) {
         case RISCV_I_OP_IMM:
             __core_set_dest(core, instr, __core_int_op(instr, false, __core_read_rs1(core, instr), __core_dec_i(instr))); break;
@@ -145,7 +146,6 @@ void core_step(core_t* core) {
             break;
 
         case RISCV_I_LOAD:
-            uint32_t value;
             core->mem_load(core, __core_read_rs1(core, instr) + __core_dec_i(instr), __core_dec_func3(instr), &value);
             if (unlikely(core->error)) return;
             __core_set_dest(core, instr, value);

@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 #define MASK(n) (~((~0U << (n))))
 
@@ -167,6 +168,8 @@ int main(int argc, char** argv) {
     }
     assert(!(((uintptr_t)stack_seg->data) & 0b11));
 
+    // FIXME: sort segments, check no overlap
+
     // initialize emulator
     core_t core;
     memset(&core, 0, sizeof(core));
@@ -180,11 +183,24 @@ int main(int argc, char** argv) {
     core.x_regs[2] = STACK_INITIAL;
 
     // emulate!
+    uint instr_count = 0;
+    struct timespec start;
+    int res = clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+    assert(!res);
+
     while (1) {
+        instr_count++;
         core_step(&core);
         if (!core.error) continue;
 
+        if (core.error == ERR_SYSTEM) break; // FIXME
         fprintf(stderr, "core error: %s\n", core_error_str(core.error));
         return 2;
     }
+
+    struct timespec end;
+    res = clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end);
+    assert(!res);
+    int64_t elapsed = ((int64_t)end.tv_sec - (int64_t)start.tv_sec) * 1000000000 + ((int64_t)end.tv_nsec - (int64_t)start.tv_nsec);
+    printf("executed %u instructions in %.3f ms\n", instr_count, elapsed / 1e6);
 }
