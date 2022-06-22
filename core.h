@@ -12,6 +12,8 @@ typedef enum {
     ERR_SYSTEM,          // EEI operation was hit
 } core_error_t;
 
+const char* core_error_str(core_error_t err);
+
 // ERR_SYSTEM is returned whenever an environment-specific instruction is executed.
 // pc is already advanced, so after finishing the operation, execution can be
 // resumed by just clearing error.
@@ -24,6 +26,7 @@ typedef enum {
 typedef struct _core_t core_t;
 struct _core_t {
     uint32_t x_regs [32];
+    // IMPORTANT: assumed to contain an aligned address at all times
     uint32_t pc;
     // address of last instruction that began execution
     uint32_t current_pc;

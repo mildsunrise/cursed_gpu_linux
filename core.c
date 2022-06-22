@@ -4,6 +4,20 @@
 #define MASK(n) (~((~0U << (n))))
 #define unlikely(x) __builtin_expect((x),0)
 
+const char* core_error_str(core_error_t err) {
+    static const char* errors [] = {
+        "NONE",
+        "BAD_INSTRUCTION",
+        "JUMP_UNALIGNED",
+        "MEM_UNMAPPED",
+        "MEM_PROTECTED",
+        "SYSTEM",
+    };
+    if (err >= 0 && err < (sizeof(errors) / sizeof(*errors)))
+        return errors[err];
+    return "UNKNOWN";
+}
+
 
 // INSTRUCTION DECODING
 
@@ -87,9 +101,10 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x) {
 }
 
 void __core_jump(core_t* core, uint32_t addr) {
-    core->pc = addr;
-    if (addr & 0b11)
+    if (unlikely(addr & 0b11))
         core->error = ERR_JUMP_UNALIGNED;
+    else
+        core->pc = addr;
 }
 
 void __core_jump_link(core_t* core, uint32_t instr, uint32_t addr) {

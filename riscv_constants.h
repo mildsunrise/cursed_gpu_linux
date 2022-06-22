@@ -34,3 +34,7 @@
 #define RISCV_MEM_LW      0b010
 #define RISCV_MEM_LBU     0b100
 #define RISCV_MEM_LHU     0b101
+
+#define RISCV_MEM_SB      0b000
+#define RISCV_MEM_SH      0b001
+#define RISCV_MEM_SW      0b010
