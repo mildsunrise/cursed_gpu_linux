@@ -10,6 +10,8 @@
 #include <time.h>
 
 #define MASK(n) (~((~0U << (n))))
+#define unlikely(x) __builtin_expect((x),0)
+#define likely(x) __builtin_expect((x),1)
 
 // leave a 4 word unmapped gap, to detect stack underflows
 #define STACK_INITIAL ((uint32_t)-16)
@@ -40,7 +42,7 @@ static segment_t *find_segment_unchecked(core_t* core, uint32_t addr, Elf32_Word
     return NULL;
 found_segment:
     // perform additional checks
-    if (!(phdr->p_flags & required_flag)) {
+    if (unlikely(!(phdr->p_flags & required_flag))) {
         core->error = ERR_MEM_PROTECTED;
         return NULL;
     }
@@ -49,7 +51,7 @@ found_segment:
 
 static segment_t *find_segment(core_t* core, uint32_t addr, Elf32_Word required_flag, uint8_t width) {
     // reject misaligned accesses (if we wanted to allow them, we'd at least have to check for overflow)
-    if ((addr & (width - 1))) {
+    if (unlikely((addr & (width - 1)))) {
         core->error = ERR_MEM_PROTECTED; // FIXME: add error for misaligned access
         return NULL;
     }
@@ -63,7 +65,7 @@ static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
 }
 
 #define MEM_SWITCH(flag, cases) \
-    Elf32_Word required_flag = flag; \
+    const Elf32_Word required_flag = flag; \
     segment_t *seg; \
     uint32_t reladdr; \
     uint32_t *cell; \
@@ -191,7 +193,7 @@ int main(int argc, char** argv) {
     while (1) {
         instr_count++;
         core_step(&core);
-        if (!core.error) continue;
+        if (likely(!core.error)) continue;
 
         if (core.error == ERR_SYSTEM) break; // FIXME
         fprintf(stderr, "core error: %s\n", core_error_str(core.error));
