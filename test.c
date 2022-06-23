@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include "measure.c"
 
 #define MASK(n) (~((~0U << (n))))
 #define unlikely(x) __builtin_expect((x),0)
@@ -185,10 +186,14 @@ int main(int argc, char** argv) {
     core.x_regs[2] = STACK_INITIAL;
 
     // emulate!
+    int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);
+    int instr_count_fd = simple_perf_counter(PERF_COUNT_HW_INSTRUCTIONS);
     uint instr_count = 0;
-    struct timespec start;
+    struct timespec start, end;
+
     int res = clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
-    assert(!res);
+    ioctl(cycle_count_fd, PERF_EVENT_IOC_ENABLE, 0);
+    ioctl(instr_count_fd, PERF_EVENT_IOC_ENABLE, 0);
 
     while (1) {
         instr_count++;
@@ -200,9 +205,19 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    struct timespec end;
-    res = clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end);
+    res |= ioctl(cycle_count_fd, PERF_EVENT_IOC_DISABLE, 0);
+    res |= ioctl(instr_count_fd, PERF_EVENT_IOC_DISABLE, 0);
+    res |= clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end);
+
     assert(!res);
     int64_t elapsed = ((int64_t)end.tv_sec - (int64_t)start.tv_sec) * 1000000000 + ((int64_t)end.tv_nsec - (int64_t)start.tv_nsec);
-    printf("executed %u instructions in %.3f ms\n", instr_count, elapsed / 1e6);
+    long long host_instr_count = simple_perf_read(instr_count_fd);
+    long long host_cycle_count = simple_perf_read(cycle_count_fd);
+    printf("executed %u instructions in %.3f ms, %lld instructions, %lld cycles\n",
+        instr_count, elapsed / 1e6, host_instr_count, host_cycle_count);
+    printf("stats: %.3f c/i, %.1f i/I, %.1f c/I, %.1f MIps\n",
+        ((double)host_cycle_count) / ((double)host_instr_count),
+        ((double)host_instr_count) / ((double)instr_count),
+        ((double)host_cycle_count) / ((double)instr_count),
+        instr_count / (double)elapsed * 1e3);
 }
