@@ -1,2 +1,7 @@
 # toolchain
 /riscv
+
+/core_test
+/emulator
+/linux_dtb
+/linux_dtb.*
