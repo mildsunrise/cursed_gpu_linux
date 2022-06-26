@@ -42,10 +42,7 @@ uint32_t __core_dec_b(uint32_t instr) {
         ((instr & (MASK(6) << 25)) >> 20);
 }
 uint32_t __core_dec_s(uint32_t instr) {
-    int32_t sign = ((int32_t)instr) & (1 << 31);
-    return (uint32_t)(sign >> 20) |
-        ((instr & (MASK(5) << 7)) >> 7) |
-        ((instr & (MASK(6) << 25)) >> 20);
+    return (uint32_t)(((int32_t)(instr & (MASK(7) << 25))) >> 20) | ((instr >> 7) & MASK(5));
 }
 
 uint32_t __core_read_rs1(const core_t* core, uint32_t instr) {
