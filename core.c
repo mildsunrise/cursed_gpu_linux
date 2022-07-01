@@ -101,6 +101,37 @@ void core_set_exception(core_t* core, uint32_t cause, uint32_t val) {
     core->exc_val = val;
 }
 
+void core_trap(core_t* core) {
+    // copy exception fields
+    core->scause = core->exc_cause;
+    core->stval = core->exc_val;
+
+    // save stuff to stack
+    core->sstatus_spie = core->sstatus_sie;
+    core->sstatus_spp = core->s_mode;
+    core->sepc = core->current_pc;
+
+    // set stuff
+    core->sstatus_sie = false;
+    core->s_mode = true;
+    core->pc = core->stvec_addr;
+    if (core->stvec_vectored)
+        core->pc += core->scause * 4;
+
+    core->error = ERR_NONE;
+}
+
+void __core_do_sret(core_t* core) {
+    // restore stuff from stack
+    core->pc = core->sepc;
+    core->s_mode = core->sstatus_spp;
+    core->sstatus_sie = core->sstatus_spie;
+
+    // reset stack
+    core->sstatus_spp = false;
+    core->sstatus_spie = true;
+}
+
 void __core_do_privileged(core_t* core, uint32_t instr) {
     if (instr & ( (MASK(5) << 7) | (MASK(5) << 15) )) {
         core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0);
@@ -111,6 +142,8 @@ void __core_do_privileged(core_t* core, uint32_t instr) {
             core_set_exception(core, RISCV_EXC_BREAKPOINT, core->current_pc); break;
         case RISCV_PRIV_ECALL:
             core_set_exception(core, core->s_mode ? RISCV_EXC_ECALL_S : RISCV_EXC_ECALL_U, 0); break;
+        case RISCV_PRIV_SRET:
+            __core_do_sret(core); break;
         default:
             core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); break;
     }
@@ -287,6 +320,15 @@ void __core_jump_link(core_t* core, uint32_t instr, uint32_t addr) {
 void core_step(core_t* core) {
     if (unlikely(core->error)) return;
     core->current_pc = core->pc;
+
+    if ((core->sstatus_sie || !core->s_mode) && (core->sip & core->sie)) {
+        uint32_t applicable = (core->sip & core->sie);
+        uint8_t idx = 32;
+        while (!(applicable & (1 << --idx))); // FIXME: use a LUT
+        core->exc_cause = (1 << 31) | idx;
+        core->stval = 0;
+        core_trap(core);
+    }
 
     uint32_t instr;
     core->mem_fetch(core, core->pc, &instr);

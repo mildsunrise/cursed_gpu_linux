@@ -76,3 +76,8 @@ void core_step(core_t* core);
 // and to prevent mistakes like forgetting to set a field (especially on future
 // refactors)
 void core_set_exception(core_t* core, uint32_t cause, uint32_t val);
+
+// delegate the currently set exception to S-mode as a trap. this doesn't check
+// core->error is EXC_EXCEPTION, it just assumes that `exc_cause` and `exc_val`
+// are correctly set. sets core->error to ERR_NONE.
+void core_trap(core_t* core);

@@ -222,6 +222,12 @@ int main() {
         core_step(&core);
         if (likely(!core.error)) continue;
 
+        // for now, don't delegate any S-mode exceptions
+        if (core.error == ERR_EXCEPTION && !core.s_mode) {
+            core_trap(&core);
+            continue;
+        }
+
         if (core.error == ERR_EXCEPTION && core.exc_cause == RISCV_EXC_ECALL_S) break;
         fprintf(stderr, "core error %s: %s. val=%#x\n", core_error_str(core.error), core_exc_cause_str(core.exc_cause), core.exc_val);
         return 2;
