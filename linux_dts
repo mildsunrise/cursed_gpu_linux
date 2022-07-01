@@ -1,0 +1,49 @@
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "mild_sunrise,cursed_gpu_emulator";
+
+	chosen {
+		bootargs = "earlycon console=ttyS0";
+		stdout-path = "serial0";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <75000000>;
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "riscv";
+			reg = <0>;
+			riscv,isa = "rv32im";
+			mmu-type = "riscv,rv32";
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	sram: memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x20000000>;
+		reg-names = "sram0";
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges = <0x0 0xF0000000 0x00010000>;
+
+		serial0: serial@0 {
+			compatible = "ns8250";
+			reg = <0x0000 0x1000>;
+			no-loopback-test;
+		};
+	};
+};
