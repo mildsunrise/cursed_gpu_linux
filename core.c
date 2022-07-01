@@ -190,8 +190,8 @@ void __core_do_system(core_t* core, uint32_t instr) {
         case RISCV_SYS_CSRRCI:
             __core_csr_cs(core, instr, __core_dec_i_unsigned(instr), 0, __core_dec_rs1(instr)); break;
 
-        // ECALL / EBREAK is the only non-CSR instruction
-        case RISCV_SYS_ECALL:
+        // privileged instruction
+        case RISCV_SYS_PRIV:
             core->error = ERR_SYSTEM; break;
 
         default:

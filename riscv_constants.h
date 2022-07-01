@@ -41,14 +41,19 @@
 #define RISCV_MEM_SH      0b001
 #define RISCV_MEM_SW      0b010
 
-#define RISCV_SYS_ECALL   0b000
-
 #define RISCV_SYS_CSRRW   0b001
 #define RISCV_SYS_CSRRS   0b010
 #define RISCV_SYS_CSRRC   0b011
 #define RISCV_SYS_CSRRWI  0b101
 #define RISCV_SYS_CSRRSI  0b110
 #define RISCV_SYS_CSRRCI  0b111
+
+#define RISCV_SYS_PRIV    0b000
+#define RISCV_PRIV_ECALL  0b000000000000
+#define RISCV_PRIV_EBREAK 0b000000000001
+#define RISCV_PRIV_SRET   0b000100000010
+#define RISCV_PRIV_MRET   0b001100000010
+#define RISCV_PRIV_WFI    0b000100000101
 
 
 // privileged ISA: CSRs
@@ -81,11 +86,35 @@
 /// S-mode (Supervisor Protection and Translation)
 #define RISCV_CSR_SATP             0x180  // SRW  Supervisor address translation and protection
 
+// privileged ISA: exception causes
+
+#define RISCV_EXC_FETCH_MISALIGN 0  // Instruction address misaligned
+#define RISCV_EXC_FETCH_FAULT    1  // Instruction access fault
+#define RISCV_EXC_ILLEGAL_INSTR  2  // Illegal instruction
+#define RISCV_EXC_BREAKPOINT     3  // Breakpoint
+#define RISCV_EXC_LOAD_MISALIGN  4  // Load address misaligned
+#define RISCV_EXC_LOAD_FAULT     5  // Load access fault
+#define RISCV_EXC_STORE_MISALIGN 6  // Store/AMO address misaligned
+#define RISCV_EXC_STORE_FAULT    7  // Store/AMO access fault
+#define RISCV_EXC_ECALL_U        8  // Environment call from U-mode
+#define RISCV_EXC_ECALL_S        9  // Environment call from S-mode
+// 10–11 Reserved
+#define RISCV_EXC_FETCH_PFAULT   12  // Instruction page fault
+#define RISCV_EXC_LOAD_PFAULT    13  // Load page fault
+// 14 Reserved
+#define RISCV_EXC_STORE_PFAULT   15  // Store/AMO page fault
 
 // privileged ISA: other
 
 #define RISCV_PAGE_BITS 12
 #define RISCV_PAGE_SIZE (1 << RISCV_PAGE_BITS)
+
+#define RISCV_INT_SSI 1
+#define RISCV_INT_SSI_BIT (1 << RISCV_INT_SSI)
+#define RISCV_INT_STI 5
+#define RISCV_INT_STI_BIT (1 << RISCV_INT_STI)
+#define RISCV_INT_SEI 9
+#define RISCV_INT_SEI_BIT (1 << RISCV_INT_SEI)
 
 
 // SBI 0.2
