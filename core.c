@@ -1,5 +1,6 @@
 #include "core.h"
 #include <stdbool.h>
+#include "reg_macros.h"
 
 #define MASK(n) (~((~0U << (n))))
 #define unlikely(x) __builtin_expect((x),0)
@@ -45,15 +46,27 @@ uint32_t __core_dec_s(uint32_t instr) {
     return (uint32_t)(((int32_t)(instr & (MASK(7) << 25))) >> 20) | ((instr >> 7) & MASK(5));
 }
 
-uint32_t __core_read_rs1(const core_t* core, uint32_t instr) {
-    return core->x_regs[(instr >> 15) & MASK(5)];
+uint16_t __core_dec_i_unsigned(uint32_t instr) {
+    return instr >> 20;
 }
-uint32_t __core_read_rs2(const core_t* core, uint32_t instr) {
-    return core->x_regs[(instr >> 20) & MASK(5)];
+uint8_t __core_dec_rd(uint32_t instr) {
+    return (instr >> 7) & MASK(5);
 }
-
+uint8_t __core_dec_rs1(uint32_t instr) {
+    return (instr >> 15) & MASK(5);
+}
+uint8_t __core_dec_rs2(uint32_t instr) {
+    return (instr >> 20) & MASK(5);
+}
 uint8_t __core_dec_func3(uint32_t instr) {
     return (instr >> 12) & MASK(3);
+}
+
+uint32_t __core_read_rs1(const core_t* core, uint32_t instr) {
+    return core->x_regs[__core_dec_rs1(instr)];
+}
+uint32_t __core_read_rs2(const core_t* core, uint32_t instr) {
+    return core->x_regs[__core_dec_rs2(instr)];
 }
 
 #define __negBit (instr & (1 << 30))
@@ -93,7 +106,7 @@ bool __core_jmp_op(core_t* core, uint32_t instr, uint32_t a, uint32_t b) {
 }
 
 void __core_set_dest(core_t* core, uint32_t instr, uint32_t x) {
-    uint32_t rd = (instr >> 7) & MASK(5);
+    uint8_t rd = __core_dec_rd(instr);
     if (rd) core->x_regs[rd] = x;
 }
 
@@ -107,6 +120,57 @@ void __core_jump(core_t* core, uint32_t addr) {
 void __core_jump_link(core_t* core, uint32_t instr, uint32_t addr) {
     __core_set_dest(core, instr, core->pc); // FIXME: if the jump fails (misalign), does rd need to be updated?
     __core_jump(core, addr);
+}
+
+#define __csr_body(R, W) \
+    /* TODO */ \
+    core->error = ERR_BAD_INSTRUCTION;
+
+REG_FUNCTIONS(void __core_csr, (core_t* core, uint16_t addr), uint32_t, __csr_body)
+
+void __core_csr_rw(core_t* core, uint32_t instr, uint16_t csr, uint32_t wvalue) {
+    uint8_t rd = __core_dec_rd(instr);
+    if (rd) {
+        uint32_t value;
+        __core_csr_read(core, csr, &value);
+        if (unlikely(core->error)) return;
+        __core_set_dest(core, instr, value);
+    }
+    __core_csr_write(core, csr, wvalue);
+}
+
+void __core_csr_cs(core_t* core, uint32_t instr, uint16_t csr, uint32_t setmask, uint32_t clearmask) {
+    uint32_t value;
+    __core_csr_read(core, csr, &value);
+    if (unlikely(core->error)) return;
+    __core_set_dest(core, instr, value);
+    if (__core_dec_rs1(instr))
+        __core_csr_write(core, csr, (value & ~clearmask) | setmask);
+}
+
+void __core_do_system(core_t* core, uint32_t instr) {
+    switch (__core_dec_func3(instr)) {
+        // CSR
+        case RISCV_SYS_CSRRW:
+            __core_csr_rw(core, instr, __core_dec_i_unsigned(instr), __core_read_rs1(core, instr)); break;
+        case RISCV_SYS_CSRRWI:
+            __core_csr_rw(core, instr, __core_dec_i_unsigned(instr), __core_dec_rs1(instr)); break;
+        case RISCV_SYS_CSRRS:
+            __core_csr_cs(core, instr, __core_dec_i_unsigned(instr), __core_read_rs1(core, instr), 0); break;
+        case RISCV_SYS_CSRRSI:
+            __core_csr_cs(core, instr, __core_dec_i_unsigned(instr), __core_dec_rs1(instr), 0); break;
+        case RISCV_SYS_CSRRC:
+            __core_csr_cs(core, instr, __core_dec_i_unsigned(instr), 0, __core_read_rs1(core, instr)); break;
+        case RISCV_SYS_CSRRCI:
+            __core_csr_cs(core, instr, __core_dec_i_unsigned(instr), 0, __core_dec_rs1(instr)); break;
+
+        // ECALL / EBREAK is the only non-CSR instruction
+        case RISCV_SYS_ECALL:
+            core->error = ERR_SYSTEM; break;
+
+        default:
+            core->error = ERR_BAD_INSTRUCTION; return;
+    }
 }
 
 void core_step(core_t* core) {
@@ -163,7 +227,8 @@ void core_step(core_t* core) {
             break;
 
         case RISCV_I_SYSTEM:
-            core->error = ERR_SYSTEM; break;
+            __core_do_system(core, instr); break;
+
         default:
             core->error = ERR_BAD_INSTRUCTION; break;
     }
