@@ -8,15 +8,36 @@
 const char* core_error_str(core_error_t err) {
     static const char* errors [] = {
         "NONE",
-        "BAD_INSTRUCTION",
-        "JUMP_UNALIGNED",
-        "MEM_UNMAPPED",
-        "MEM_PROTECTED",
-        "SYSTEM",
+        "EXCEPTION",
+        "USER",
     };
     if (err >= 0 && err < (sizeof(errors) / sizeof(*errors)))
         return errors[err];
     return "UNKNOWN";
+}
+
+const char* core_exc_cause_str(uint32_t err) {
+    static const char* errors [] = {
+        "Instruction address misaligned",
+        "Instruction access fault",
+        "Illegal instruction",
+        "Breakpoint",
+        "Load address misaligned",
+        "Load access fault",
+        "Store/AMO address misaligned",
+        "Store/AMO access fault",
+        "Environment call from U-mode",
+        "Environment call from S-mode",
+        NULL,
+        NULL,
+        "Instruction page fault",
+        "Load page fault",
+        NULL,
+        "Store/AMO page fault",
+    };
+    if (err < (sizeof(errors) / sizeof(*errors)) && errors[err])
+        return errors[err];
+    return "[Unknown]";
 }
 
 
@@ -72,6 +93,30 @@ uint32_t __core_read_rs2(const core_t* core, uint32_t instr) {
 #define __negBit (instr & (1 << 30))
 
 
+// EXCEPTIONS, TRAPS, INTERRUPTS
+
+void core_set_exception(core_t* core, uint32_t cause, uint32_t val) {
+    core->error = ERR_EXCEPTION;
+    core->exc_cause = cause;
+    core->exc_val = val;
+}
+
+void __core_do_privileged(core_t* core, uint32_t instr) {
+    if (instr & ( (MASK(5) << 7) | (MASK(5) << 15) )) {
+        core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0);
+        return;
+    }
+    switch (__core_dec_i_unsigned(instr)) {
+        case RISCV_PRIV_EBREAK:
+            core_set_exception(core, RISCV_EXC_BREAKPOINT, core->current_pc); break;
+        case RISCV_PRIV_ECALL:
+            core_set_exception(core, core->s_mode ? RISCV_EXC_ECALL_S : RISCV_EXC_ECALL_U, 0); break;
+        default:
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); break;
+    }
+}
+
+
 // CSR INSTRUCTIONS
 
 void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
@@ -94,7 +139,7 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
         if ((addr >> 8) == 0xC) { \
             uint16_t idx = addr & MASK(7); \
             if (idx >= 0x20 || !((core->scounteren >> idx) & 1)) \
-                core->error = ERR_BAD_INSTRUCTION; \
+                core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
             else \
                 /* we'll use the instruction counter for all of the counters. ideally,
                 reads should return the value before the increment, and writes should
@@ -105,7 +150,7 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
         } \
     ) \
     if (!core->s_mode) { \
-        core->error = ERR_BAD_INSTRUCTION; \
+        core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
         return; \
     } \
     switch (addr) { \
@@ -138,7 +183,7 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
         REG_CASE_RW(R, W, RISCV_CSR_SCAUSE, core->scause) \
         REG_CASE_RW(R, W, RISCV_CSR_STVAL, core->stval) \
         default: \
-            core->error = ERR_BAD_INSTRUCTION; \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
     }
 
 REG_FUNCTIONS(void __core_csr, (core_t* core, uint16_t addr), uint32_t, __csr_body)
@@ -181,10 +226,10 @@ void __core_do_system(core_t* core, uint32_t instr) {
 
         // privileged instruction
         case RISCV_SYS_PRIV:
-            core->error = ERR_SYSTEM; break;
+            __core_do_privileged(core, instr); break;
 
         default:
-            core->error = ERR_BAD_INSTRUCTION; return;
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); return;
     }
 }
 
@@ -218,7 +263,7 @@ bool __core_jmp_op(core_t* core, uint32_t instr, uint32_t a, uint32_t b) {
         case RISCV_BFUNC_BLT:  return ((int32_t)a)  < ((int32_t)b);
         case RISCV_BFUNC_BGE:  return ((int32_t)a) >= ((int32_t)b);
     }
-    core->error = ERR_BAD_INSTRUCTION;
+    core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0);
     return false;
 }
 
@@ -229,7 +274,7 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x) {
 
 void __core_jump(core_t* core, uint32_t addr) {
     if (unlikely(addr & 0b11))
-        core->error = ERR_JUMP_UNALIGNED;
+        core_set_exception(core, RISCV_EXC_PC_MISALIGN, addr);
     else
         core->pc = addr;
 }
@@ -290,7 +335,7 @@ void core_step(core_t* core) {
                 case RISCV_MM_FENCE_I:
                     break; // currently no-op, we're singlethreaded
                 default:
-                    core->error = ERR_BAD_INSTRUCTION; break;
+                    core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); break;
             }
             break;
 
@@ -298,6 +343,6 @@ void core_step(core_t* core) {
             __core_do_system(core, instr); break;
 
         default:
-            core->error = ERR_BAD_INSTRUCTION; break;
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); break;
     }
 }

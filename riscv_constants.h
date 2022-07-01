@@ -88,7 +88,7 @@
 
 // privileged ISA: exception causes
 
-#define RISCV_EXC_FETCH_MISALIGN 0  // Instruction address misaligned
+#define RISCV_EXC_PC_MISALIGN    0  // Instruction address misaligned
 #define RISCV_EXC_FETCH_FAULT    1  // Instruction access fault
 #define RISCV_EXC_ILLEGAL_INSTR  2  // Illegal instruction
 #define RISCV_EXC_BREAKPOINT     3  // Breakpoint

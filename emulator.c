@@ -20,7 +20,7 @@
 #define MEM_CASE(func, width, code) \
     case (func): \
     if (unlikely((addr & ((width) - 1)))) { \
-        core->error = ERR_MEM_PROTECTED; /* FIXME: add error for misaligned access */ \
+        core_set_exception(core, exc_cause, addr); \
         break; \
     } \
     offset = (addr & 0b11) * 8; \
@@ -30,6 +30,7 @@
 #define __main_mem_body(R, W) \
     uint32_t *cell; \
     uint8_t offset; \
+    const uint32_t exc_cause = R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN); \
     switch (width) { \
     R( \
         MEM_CASE(RISCV_MEM_LW,  4, *value = *cell) \
@@ -44,7 +45,7 @@
         MEM_CASE(RISCV_MEM_SB,  1, *cell = ((*cell) & ~(MASK(8) << offset)) | (value & MASK(8)) << offset) \
     ) \
         default: \
-            core->error = ERR_BAD_INSTRUCTION; \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
             return; \
     }
 
@@ -112,10 +113,10 @@ REG_FUNCTIONS(void u8250_reg, (u8250_state_t *uart, uint32_t addr), uint8_t, __u
         R(case RISCV_MEM_LH:) \
         W(case RISCV_MEM_SW:) \
         W(case RISCV_MEM_SH:) \
-            core->error = ERR_MEM_PROTECTED; /* FIXME: error for misaligned */ \
+            core_set_exception(core, R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN), addr); \
             return; \
         default: \
-            core->error = ERR_BAD_INSTRUCTION; \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
             return; \
     }
 
@@ -136,8 +137,8 @@ typedef struct {
 static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
     emu_state_t *data = (emu_state_t *)core->user_data;
     if (unlikely(addr >= RAM_SIZE)) {
-        // FIXME: check for other regions, issue MEM_PROTECTED if needed
-        core->error = ERR_MEM_UNMAPPED;
+        // FIXME: check for other regions
+        core_set_exception(core, RISCV_EXC_FETCH_FAULT, addr);
         return;
     }
     *value = data->ram[addr >> 2];
@@ -157,7 +158,7 @@ static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
                 REG_FUNC(R, W, u8250_wrap_mem)(core, &data->uart, addr & 0xFFF, width, value); return; \
         } \
     } \
-    core->error = ERR_MEM_UNMAPPED;
+    core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), addr);
 
 REG_FUNCTIONS(void mem, (core_t *core, uint32_t addr, uint8_t width), uint32_t, __mem_body)
 
@@ -221,8 +222,8 @@ int main() {
         core_step(&core);
         if (likely(!core.error)) continue;
 
-        if (core.error == ERR_SYSTEM) break; // FIXME
-        fprintf(stderr, "core error: %s\n", core_error_str(core.error));
+        if (core.error == ERR_EXCEPTION && core.exc_cause == RISCV_EXC_ECALL_S) break;
+        fprintf(stderr, "core error %s: %s. val=%#x\n", core_error_str(core.error), core_exc_cause_str(core.exc_cause), core.exc_val);
         return 2;
     }
 

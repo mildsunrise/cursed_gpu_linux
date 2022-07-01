@@ -28,7 +28,7 @@ typedef struct {
     size_t nsegments;
 } emu_state_t;
 
-static segment_t *find_segment_unchecked(core_t* core, uint32_t addr, Elf32_Word required_flag, uint8_t width) {
+static segment_t *find_segment_unchecked(core_t* core, uint32_t exc_cause, uint32_t addr, Elf32_Word required_flag, uint8_t width) {
     emu_state_t *data = (emu_state_t *)core->user_data;
     // search for appropriate segment
     size_t n;
@@ -39,34 +39,36 @@ static segment_t *find_segment_unchecked(core_t* core, uint32_t addr, Elf32_Word
         if (addr >= phdr->p_vaddr && end_addr - phdr->p_vaddr <= phdr->p_memsz)
             goto found_segment;
     }
-    core->error = ERR_MEM_UNMAPPED;
+    core_set_exception(core, exc_cause, addr);
     return NULL;
 found_segment:
     // perform additional checks
     if (unlikely(!(phdr->p_flags & required_flag))) {
-        core->error = ERR_MEM_PROTECTED;
+        core_set_exception(core, exc_cause, addr);
         return NULL;
     }
     return &data->segments[n];
 }
 
-static segment_t *find_segment(core_t* core, uint32_t addr, Elf32_Word required_flag, uint8_t width) {
+static segment_t *find_segment(core_t* core, uint32_t exc_cause_f, uint32_t exc_cause, uint32_t addr, Elf32_Word required_flag, uint8_t width) {
     // reject misaligned accesses (if we wanted to allow them, we'd at least have to check for overflow)
     if (unlikely((addr & (width - 1)))) {
-        core->error = ERR_MEM_PROTECTED; // FIXME: add error for misaligned access
+        core_set_exception(core, exc_cause, addr);
         return NULL;
     }
-    return find_segment_unchecked(core, addr, required_flag, width);
+    return find_segment_unchecked(core, exc_cause_f, addr, required_flag, width);
 }
 
 static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
     segment_t *seg;
-    if (!(seg = find_segment_unchecked(core, addr, PF_X, 4))) return;
+    if (!(seg = find_segment_unchecked(core, RISCV_EXC_FETCH_FAULT, addr, PF_X, 4))) return;
     *value = seg->data[(addr - seg->phdr.p_vaddr) >> 2];
 }
 
-#define MEM_SWITCH(flag, cases) \
+#define MEM_SWITCH(flag, exc_cause_f, exc_cause, cases) \
     const Elf32_Word required_flag = flag; \
+    const uint32_t _exc_cause_f = exc_cause_f; \
+    const uint32_t _exc_cause = exc_cause; \
     segment_t *seg; \
     uint32_t reladdr; \
     uint32_t *cell; \
@@ -74,20 +76,20 @@ static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
     switch (width) { \
         cases \
         default: \
-            core->error = ERR_BAD_INSTRUCTION; \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
             return; \
     }
 
 #define MEM_CASE(func, width, code) \
     case (func): \
-    if (!(seg = find_segment(core, addr, required_flag, (width)))) return; \
+    if (!(seg = find_segment(core, _exc_cause_f, _exc_cause, addr, required_flag, (width)))) return; \
     reladdr = addr - seg->phdr.p_vaddr; \
     offset = (reladdr & 0b11) * 8; \
     cell = &seg->data[reladdr >> 2]; \
     code; break;
 
 static void mem_load(core_t* core, uint32_t addr, uint8_t width, uint32_t* value) {
-    MEM_SWITCH(PF_R,
+    MEM_SWITCH(PF_R, RISCV_EXC_LOAD_FAULT, RISCV_EXC_LOAD_MISALIGN,
         MEM_CASE(RISCV_MEM_LW, 4, *value = *cell)
         MEM_CASE(RISCV_MEM_LHU, 2, *value = (uint32_t)(uint16_t)((*cell) >> offset))
         MEM_CASE(RISCV_MEM_LH, 2, *value = (uint32_t)(int32_t)(int16_t)((*cell) >> offset))
@@ -97,7 +99,7 @@ static void mem_load(core_t* core, uint32_t addr, uint8_t width, uint32_t* value
 }
 
 static void mem_store(core_t* core, uint32_t addr, uint8_t width, uint32_t value) {
-    MEM_SWITCH(PF_W,
+    MEM_SWITCH(PF_W, RISCV_EXC_STORE_FAULT, RISCV_EXC_STORE_MISALIGN,
         MEM_CASE(RISCV_MEM_SW, 4, *cell = value)
         MEM_CASE(RISCV_MEM_SH, 2, *cell = ((*cell) & ~(MASK(16) << offset)) | (value & MASK(16)) << offset)
         MEM_CASE(RISCV_MEM_SB, 1, *cell = ((*cell) & ~(MASK(8) << offset)) | (value & MASK(8)) << offset)
@@ -198,8 +200,8 @@ int main(int argc, char** argv) {
         core_step(&core);
         if (likely(!core.error)) continue;
 
-        if (core.error == ERR_SYSTEM) break; // FIXME
-        fprintf(stderr, "core error: %s\n", core_error_str(core.error));
+        if (core.error == ERR_EXCEPTION && core.exc_cause == RISCV_EXC_ECALL_U) break;
+        fprintf(stderr, "core error %s: %s. val=%#x\n", core_error_str(core.error), core_exc_cause_str(core.exc_cause), core.exc_val);
         return 2;
     }
 
