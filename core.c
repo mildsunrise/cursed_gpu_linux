@@ -122,6 +122,19 @@ void __core_jump_link(core_t* core, uint32_t instr, uint32_t addr) {
     __core_jump(core, addr);
 }
 
+#define CSR_BITFIELD_CASE(R, W, CASE, CODE) \
+    case (CASE): \
+        R(*value = 0;) \
+        CODE \
+        break;
+
+#define CSR_BITFIELD_BOOL(R, W, BIT, LVALUE) \
+    R((LVALUE) && (*value |= 1 << (BIT));) \
+    W((LVALUE) = (value & (1 << (BIT))) != 0;)
+
+#define SIE_MASK ( RISCV_INT_SEI_BIT | RISCV_INT_STI_BIT | RISCV_INT_SSI_BIT )
+#define SIP_MASK (                 0 |                 0 | RISCV_INT_SSI_BIT )
+
 #define __csr_body(R, W) \
     R( \
         if ((addr >> 8) == 0xC) { \
@@ -142,7 +155,29 @@ void __core_jump_link(core_t* core, uint32_t instr, uint32_t addr) {
         return; \
     } \
     switch (addr) { \
-        /* FIXME: sstatus, sie, sip, stvec, satp */ \
+        CSR_BITFIELD_CASE(R, W, RISCV_CSR_SSTATUS, \
+            CSR_BITFIELD_BOOL(R, W, 1, core->sstatus_sie) \
+            CSR_BITFIELD_BOOL(R, W, 5, core->sstatus_spie) \
+            CSR_BITFIELD_BOOL(R, W, 8, core->sstatus_spp) \
+            CSR_BITFIELD_BOOL(R, W, 18, core->sstatus_sum) \
+            CSR_BITFIELD_BOOL(R, W, 19, core->sstatus_mxr) \
+        ) \
+        case RISCV_CSR_SIE: \
+            W(value &= SIE_MASK;) \
+            REG_LVALUE(R, W, core->sie) break; \
+        case RISCV_CSR_SIP: \
+            W(value &= SIP_MASK; value |= core->sip & ~SIP_MASK;) \
+            REG_LVALUE(R, W, core->sip) break; \
+        CSR_BITFIELD_CASE(R, W, RISCV_CSR_STVEC, \
+            REG_LVALUE(R, W, core->stvec_addr) \
+            W(core->stvec_addr &= ~0b11;) \
+            CSR_BITFIELD_BOOL(R, W, 0, core->stvec_vectored) \
+        ) \
+        CSR_BITFIELD_CASE(R, W, RISCV_CSR_SATP, \
+            R(*value = core->satp_addr >> 12;) \
+            W(core->satp_addr = value << 12;) \
+            CSR_BITFIELD_BOOL(R, W, 31, core->stvec_vectored) \
+        ) \
         REG_CASE_RW(R, W, RISCV_CSR_SCOUNTEREN, core->scounteren) \
         REG_CASE_RW(R, W, RISCV_CSR_SSCRATCH, core->sscratch) \
         REG_CASE_RW(R, W, RISCV_CSR_SEPC, core->sepc) \
