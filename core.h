@@ -10,19 +10,53 @@ typedef enum {
     ERR_USER,       // user-specific error
 } core_error_t;
 
+// returns the identifier for an error code as a string
 const char* core_error_str(core_error_t err);
 
+// returns a readable description for a RISC-V exception cause
 const char* core_exc_cause_str(uint32_t cause);
 
-// ERR_SYSTEM is returned whenever an environment-specific instruction is executed.
-// pc is already advanced, so after finishing the operation, execution can be
-// resumed by just clearing error.
-
+// # Introduction
 //
-// you may also set ERR_SYSTEM from callbacks to signal that the instruction is halted
-// pending operation from the environment. when doing this, it probably makes sense
-// to also set core->pc = core->current_pc so that the instruction will be retried.
-// core state. initialize with zeros (I'm too lazy to make an init function)
+// to use the emulator, zero-initialize a core_t struct (I'm too lazy to
+// make an init function) and set the environment-supplied callbacks.
+// all of them are currently required.
+//
+// set any other field you need (argument registers and s_mode are frequent,
+// though they all have sane defaults). some fields only admit a subset of
+// values; make sure all restrictions are satisfied on all fields before
+// starting emulation, or you may get UB.
+//
+// once everything is set up, you basically call core_step() in a loop.
+// each call (attempts to) execute one instruction.
+//
+// if execution completes successfully then core->error will be ERR_NONE;
+// otherwise execution is halted and core->error describes the error.
+// you need to handle the emulation error before calling core_step()
+// again (or it won't do anything). each possible error is described in a
+// section below.
+//
+// ## RISC-V exceptions
+//
+// ERR_EXCEPTION means the instruction raised one of the exceptions defined
+// in the spec. if set, then the additional fields `exc_cause` and `exc_val`
+// must have also been set to values according to the spec.
+//
+// common way to handle exceptions include:
+//
+//  - environment call: since pc is already advanced, environment calls can be
+//    handled by simply clearing error after finishing the operation.
+//  - faults: when handling faults, also set core->pc = core->current_pc so
+//    that the instruction will be retried.
+//  - traps: exceptions can be delegated to the emulated code in the form of
+//    S-mode traps, by calling core_trap(). it takes care of clearing error.
+//
+// ## User errors
+//
+// ERR_USER is never set from a core_*() function; it's reserved for user
+// callbacks to halt instruction execution and cause core_step() to return.
+// unless it's from a fetch, pc will be advanced, so the same applies.
+
 typedef struct _core_t core_t;
 struct _core_t {
     uint32_t x_regs [32];
