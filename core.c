@@ -74,6 +74,8 @@ uint32_t __core_read_rs2(const core_t* core, uint32_t instr) {
 
 // CSR INSTRUCTIONS
 
+void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
+
 #define CSR_BITFIELD_CASE(R, W, CASE, CODE) \
     case (CASE): \
         R(*value = 0;) \

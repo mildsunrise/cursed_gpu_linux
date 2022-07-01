@@ -138,6 +138,7 @@ static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
     if (unlikely(addr >= RAM_SIZE)) {
         // FIXME: check for other regions, issue MEM_PROTECTED if needed
         core->error = ERR_MEM_UNMAPPED;
+        return;
     }
     *value = data->ram[addr >> 2];
 }
