@@ -123,8 +123,34 @@ void __core_jump_link(core_t* core, uint32_t instr, uint32_t addr) {
 }
 
 #define __csr_body(R, W) \
-    /* TODO */ \
-    core->error = ERR_BAD_INSTRUCTION;
+    R( \
+        if ((addr >> 8) == 0xC) { \
+            uint16_t idx = addr & MASK(7); \
+            if (idx >= 0x20 || !((core->scounteren >> idx) & 1)) \
+                core->error = ERR_BAD_INSTRUCTION; \
+            else \
+                /* we'll use the instruction counter for all of the counters. ideally,
+                reads should return the value before the increment, and writes should
+                set the value after the increment. but we don't expose any way to write
+                the counters, so I don't think it'll cause visible issues */ \
+                *value = (addr & (1 << 7)) ? core->instr_count_h : core->instr_count; \
+            return; \
+        } \
+    ) \
+    if (!core->s_mode) { \
+        core->error = ERR_BAD_INSTRUCTION; \
+        return; \
+    } \
+    switch (addr) { \
+        /* FIXME: sstatus, sie, sip, stvec, satp */ \
+        REG_CASE_RW(R, W, RISCV_CSR_SCOUNTEREN, core->scounteren) \
+        REG_CASE_RW(R, W, RISCV_CSR_SSCRATCH, core->sscratch) \
+        REG_CASE_RW(R, W, RISCV_CSR_SEPC, core->sepc) \
+        REG_CASE_RW(R, W, RISCV_CSR_SCAUSE, core->scause) \
+        REG_CASE_RW(R, W, RISCV_CSR_STVAL, core->stval) \
+        default: \
+            core->error = ERR_BAD_INSTRUCTION; \
+    }
 
 REG_FUNCTIONS(void __core_csr, (core_t* core, uint16_t addr), uint32_t, __csr_body)
 
@@ -182,6 +208,8 @@ void core_step(core_t* core) {
     if (unlikely(core->error)) return;
 
     core->pc += 4;
+    core->instr_count++;
+    if (!core->instr_count) core->instr_count_h++;
 
     uint32_t instr_opcode = instr & MASK(7);
     uint32_t value;

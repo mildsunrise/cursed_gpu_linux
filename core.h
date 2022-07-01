@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "riscv_constants.h"
 
 typedef enum {
@@ -30,7 +31,32 @@ struct _core_t {
     uint32_t pc;
     // address of last instruction that began execution
     uint32_t current_pc;
+    // 'instructions executed' 64-bit counter. currently used
+    // as "real-time clock", instruction-retired counter, and cycle counter.
+    // should not be modified between logical resets.
+    uint32_t instr_count, instr_count_h;
+    // used internally to represent exceptions (that may later become traps)
+    // or externally (by core or user) to signal exception to the environment
     core_error_t error;
+
+    // supervisor state
+    bool s_mode;
+    bool sstatus_spp;     // state saved at trap
+    bool sstatus_spie;
+    uint32_t sepc;
+    uint32_t scause;
+    uint32_t stval;
+    bool sstatus_mxr;     // alter MMU access rules
+    bool sstatus_sum;
+    bool sstatus_sie;     // interrupt state
+    uint32_t sie;
+    uint32_t sip;
+    uint32_t stvec_addr;  // trap config
+    bool stvec_vectored;
+    uint32_t sscratch;    // misc
+    uint32_t scounteren;
+    bool satp_enabled;    // MMU
+    uint32_t satp_addr;
 
     // ENVIRONMENT SUPPLIED
     void* user_data;

@@ -188,7 +188,6 @@ int main(int argc, char** argv) {
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);
     int instr_count_fd = simple_perf_counter(PERF_COUNT_HW_INSTRUCTIONS);
-    uint instr_count = 0;
     struct timespec start, end;
 
     int res = clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
@@ -196,7 +195,6 @@ int main(int argc, char** argv) {
     ioctl(instr_count_fd, PERF_EVENT_IOC_ENABLE, 0);
 
     while (1) {
-        instr_count++;
         core_step(&core);
         if (likely(!core.error)) continue;
 
@@ -214,10 +212,10 @@ int main(int argc, char** argv) {
     long long host_instr_count = simple_perf_read(instr_count_fd);
     long long host_cycle_count = simple_perf_read(cycle_count_fd);
     printf("executed %u instructions in %.3f ms, %lld instructions, %lld cycles\n",
-        instr_count, elapsed / 1e6, host_instr_count, host_cycle_count);
+        core.instr_count, elapsed / 1e6, host_instr_count, host_cycle_count);
     printf("stats: %.3f c/i, %.1f i/I, %.1f c/I, %.1f MIps\n",
         ((double)host_cycle_count) / ((double)host_instr_count),
-        ((double)host_instr_count) / ((double)instr_count),
-        ((double)host_cycle_count) / ((double)instr_count),
-        instr_count / (double)elapsed * 1e3);
+        ((double)host_instr_count) / ((double)core.instr_count),
+        ((double)host_cycle_count) / ((double)core.instr_count),
+        core.instr_count / (double)elapsed * 1e3);
 }
