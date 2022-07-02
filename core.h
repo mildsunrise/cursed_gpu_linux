@@ -60,6 +60,8 @@ const char* core_exc_cause_str(uint32_t cause);
 typedef struct _core_t core_t;
 struct _core_t {
     uint32_t x_regs [32];
+    // LR reservation virtual address. last bit is 1 if valid
+    uint32_t lr_reservation;
     // IMPORTANT: assumed to contain an aligned address at all times
     uint32_t pc;
     // address of last instruction that began execution

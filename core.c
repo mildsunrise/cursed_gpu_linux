@@ -83,6 +83,9 @@ uint8_t __core_dec_rs2(uint32_t instr) {
 uint8_t __core_dec_func3(uint32_t instr) {
     return (instr >> 12) & MASK(3);
 }
+uint8_t __core_dec_func5(uint32_t instr) {
+    return instr >> 27;
+}
 
 uint32_t __core_read_rs1(const core_t* core, uint32_t instr) {
     return core->x_regs[__core_dec_rs1(instr)];
@@ -194,7 +197,8 @@ void __core_mmu_fetch(core_t* core, uint32_t addr, uint32_t* value) {
     if (core->error) return;
     core->mem_fetch(core, addr, value);
 }
-void __core_mmu_load(core_t* core, uint32_t addr, uint8_t width, uint32_t* value) {
+
+void __core_mmu_load(core_t* core, uint32_t addr, uint8_t width, uint32_t* value, bool reserved) {
     __core_mmu_translate(core, &addr,
         (1 << 1) | (core->sstatus_mxr ? (1 << 3) : 0),
         (1 << 6),
@@ -202,15 +206,30 @@ void __core_mmu_load(core_t* core, uint32_t addr, uint8_t width, uint32_t* value
         RISCV_EXC_LOAD_FAULT, RISCV_EXC_LOAD_PFAULT);
     if (core->error) return;
     core->mem_load(core, addr, width, value);
+    if (core->error) return;
+
+    if (unlikely(reserved))
+        core->lr_reservation = addr | 1;
 }
-void __core_mmu_store(core_t* core, uint32_t addr, uint8_t width, uint32_t value) {
+
+bool __core_mmu_store(core_t* core, uint32_t addr, uint8_t width, uint32_t value, bool conditional) {
     __core_mmu_translate(core, &addr,
         (1 << 2),
         (1 << 6) | (1 << 7),
         core->sstatus_sum && core->s_mode,
         RISCV_EXC_STORE_FAULT, RISCV_EXC_STORE_PFAULT);
-    if (core->error) return;
+    if (core->error) return false;
+
+    if (unlikely(conditional)) {
+        if (core->lr_reservation != (addr | 1))
+            return false;
+        core->lr_reservation = 0;
+    } else {
+        if (unlikely(core->lr_reservation & 1) && (core->lr_reservation & ~3) == (addr & ~3))
+            core->lr_reservation = 0;
+    }
     core->mem_store(core, addr, width, value);
+    return true;
 }
 
 
@@ -441,6 +460,34 @@ void __core_jump_link(core_t* core, uint32_t instr, uint32_t addr) {
     __core_jump(core, addr);
 }
 
+void __core_do_amo(core_t* core, uint32_t instr) {
+    if (unlikely(__core_dec_func3(instr) != RISCV_AMO__W))
+        return core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0);
+    uint32_t addr;
+    switch (__core_dec_func5(instr)) {
+        case RISCV_AMO_LR:
+            if ((addr = __core_read_rs1(core, instr)) & 0b11)
+                return core_set_exception(core, RISCV_EXC_LOAD_MISALIGN, addr);
+            if (__core_dec_rs2(instr))
+                return core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0);
+            uint32_t value;
+            __core_mmu_load(core, addr, RISCV_MEM_LW, &value, true);
+            if (core->error) return;
+            __core_set_dest(core, instr, value);
+            break;
+        case RISCV_AMO_SC:
+            if ((addr = __core_read_rs1(core, instr)) & 0b11)
+                return core_set_exception(core, RISCV_EXC_STORE_MISALIGN, addr);
+            bool ok = __core_mmu_store(core, addr, RISCV_MEM_SW, __core_read_rs2(core, instr), true);
+            if (core->error) return;
+            __core_set_dest(core, instr, ok ? 0 : 1);
+            break;
+
+        default:
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); return;
+    }
+}
+
 void core_step(core_t* core) {
     if (unlikely(core->error)) return;
     core->current_pc = core->pc;
@@ -486,12 +533,12 @@ void core_step(core_t* core) {
             break;
 
         case RISCV_I_LOAD:
-            __core_mmu_load(core, __core_read_rs1(core, instr) + __core_dec_i(instr), __core_dec_func3(instr), &value);
+            __core_mmu_load(core, __core_read_rs1(core, instr) + __core_dec_i(instr), __core_dec_func3(instr), &value, false);
             if (unlikely(core->error)) return;
             __core_set_dest(core, instr, value);
             break;
         case RISCV_I_STORE:
-            __core_mmu_store(core, __core_read_rs1(core, instr) + __core_dec_s(instr), __core_dec_func3(instr), __core_read_rs2(core, instr));
+            __core_mmu_store(core, __core_read_rs1(core, instr) + __core_dec_s(instr), __core_dec_func3(instr), __core_read_rs2(core, instr), false);
             if (unlikely(core->error)) return;
             break;
 
@@ -504,6 +551,9 @@ void core_step(core_t* core) {
                     core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); break;
             }
             break;
+
+        case RISCV_I_AMO:
+            __core_do_amo(core, instr); break;
 
         case RISCV_I_SYSTEM:
             __core_do_system(core, instr); break;
