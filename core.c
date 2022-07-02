@@ -460,28 +460,47 @@ void __core_jump_link(core_t* core, uint32_t instr, uint32_t addr) {
     __core_jump(core, addr);
 }
 
+#define __AMO_CASE(CASE, STORED_EXPR) \
+    case (CASE): \
+        value2 = __core_read_rs2(core, instr); \
+        __core_mmu_load(core, addr, RISCV_MEM_LW, &value, false); \
+        if (core->error) return; \
+        __core_set_dest(core, instr, value); \
+        __core_mmu_store(core, addr, RISCV_MEM_SW, (STORED_EXPR), false); \
+        break;
+
 void __core_do_amo(core_t* core, uint32_t instr) {
     if (unlikely(__core_dec_func3(instr) != RISCV_AMO__W))
         return core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0);
-    uint32_t addr;
+    uint32_t addr = __core_read_rs1(core, instr);
+    uint32_t value, value2;
     switch (__core_dec_func5(instr)) {
         case RISCV_AMO_LR:
-            if ((addr = __core_read_rs1(core, instr)) & 0b11)
+            if (addr & 0b11)
                 return core_set_exception(core, RISCV_EXC_LOAD_MISALIGN, addr);
             if (__core_dec_rs2(instr))
                 return core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0);
-            uint32_t value;
             __core_mmu_load(core, addr, RISCV_MEM_LW, &value, true);
             if (core->error) return;
             __core_set_dest(core, instr, value);
             break;
         case RISCV_AMO_SC:
-            if ((addr = __core_read_rs1(core, instr)) & 0b11)
+            if (addr & 0b11)
                 return core_set_exception(core, RISCV_EXC_STORE_MISALIGN, addr);
             bool ok = __core_mmu_store(core, addr, RISCV_MEM_SW, __core_read_rs2(core, instr), true);
             if (core->error) return;
             __core_set_dest(core, instr, ok ? 0 : 1);
             break;
+
+        __AMO_CASE(RISCV_AMO_AMOSWAP, value2)
+        __AMO_CASE(RISCV_AMO_AMOADD, value + value2)
+        __AMO_CASE(RISCV_AMO_AMOXOR, value ^ value2)
+        __AMO_CASE(RISCV_AMO_AMOAND, value & value2)
+        __AMO_CASE(RISCV_AMO_AMOOR,  value | value2)
+        __AMO_CASE(RISCV_AMO_AMOMIN, ((int32_t)value) < ((int32_t)value2) ? value : value2)
+        __AMO_CASE(RISCV_AMO_AMOMAX, ((int32_t)value) > ((int32_t)value2) ? value : value2)
+        __AMO_CASE(RISCV_AMO_AMOMINU, value < value2 ? value : value2)
+        __AMO_CASE(RISCV_AMO_AMOMAXU, value > value2 ? value : value2)
 
         default:
             core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); return;

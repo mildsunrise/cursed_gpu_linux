@@ -18,7 +18,7 @@
 			device_type = "cpu";
 			compatible = "riscv";
 			reg = <0>;
-			riscv,isa = "rv32im";
+			riscv,isa = "rv32ima";
 			mmu-type = "riscv,rv32";
 			cpu0_intc: interrupt-controller {
 				#interrupt-cells = <1>;
