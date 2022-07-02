@@ -1,5 +1,6 @@
 #include "core.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include "reg_macros.h"
 
 #define MASK(n) (~((~0U << (n))))
@@ -93,6 +94,126 @@ uint32_t __core_read_rs2(const core_t* core, uint32_t instr) {
 #define __negBit (instr & (1 << 30))
 
 
+// VIRTUAL ADDRESSING
+
+// we pre-verify the root page table, so that
+// at most 1 page table access is done at translation time
+void __core_mmu_set(core_t* core, uint32_t satp) {
+    if (satp >> 31) {
+        uint32_t* page_table = core->mem_page_table(core, satp & MASK(22));
+        if (!page_table) return;
+        core->page_table = page_table;
+        satp &= ~(MASK(9) << 22);
+    } else {
+        core->page_table = NULL;
+        satp = 0;
+    }
+    core->satp = satp;
+}
+
+#define __PTE_ITERATION(page_table, vpn, additional_checks) \
+    *pte = &(page_table)[vpn]; \
+    switch ((**pte) & MASK(4)) { \
+        case 0b0001: \
+            break; /* pointer to next level */ \
+        case 0b0011: \
+        case 0b0111: \
+        case 0b1001: \
+        case 0b1011: \
+        case 0b1111: \
+            *ppn = (**pte) >> 10; \
+            additional_checks \
+            return true; /* leaf entry */ \
+        case 0b0101: \
+        case 0b1101: \
+        default: \
+            *pte = NULL; \
+            return true; /* not valid */ \
+    }
+
+// assumes core->page_table is set!
+// if there's an error fetching a page table, returns false.
+// otherwise returns true and:
+//   - in case of valid leaf: sets *pte and *ppn
+//   - none found (page fault): sets *pte to NULL
+bool __core_mmu_lookup(const core_t* core, uint32_t vpn, uint32_t** pte, uint32_t *ppn) {
+    __PTE_ITERATION(core->page_table, vpn >> 10,
+        if (unlikely((*ppn) & MASK(10))) // misaligned superpage
+            *pte = NULL;
+        else
+            *ppn |= vpn & MASK(10);
+    )
+    uint32_t* page_table = core->mem_page_table(core, (**pte) >> 10);
+    if (!page_table) return false;
+    __PTE_ITERATION(page_table, vpn & MASK(10),)
+    *pte = NULL;
+    return true;
+}
+
+void __core_mmu_translate(core_t* core, uint32_t *addr, uint32_t access_bits, uint32_t set_bits, bool skip_privilege_test, uint8_t fault, uint8_t pfault) {
+    core->exc_val = *addr; // hack: save virtual address, for physical accesses to set exception
+    if (!core->page_table)
+        return;
+
+    uint32_t *pte_ref;
+    uint32_t ppn;
+    bool ok = __core_mmu_lookup(core, (*addr) >> RISCV_PAGE_SHIFT, &pte_ref, &ppn);
+    if (unlikely(!ok)) {
+        core_set_exception(core, fault, *addr);
+        return;
+    }
+
+    uint32_t pte;
+    if (!(
+        pte_ref // PTE lookup was successful
+        && !(ppn >> 20) // PPN is valid
+        && (pte = *pte_ref, pte & access_bits) // access type is allowed
+        && (!(pte & (1 << 4)) == core->s_mode || skip_privilege_test) // privilege matches
+    )) {
+        core_set_exception(core, pfault, *addr);
+        return;
+    }
+
+    uint32_t new_pte = pte | set_bits;
+    if (new_pte != pte)
+        *pte_ref = new_pte;
+
+    *addr = ((*addr) & MASK(RISCV_PAGE_SHIFT)) | (ppn << RISCV_PAGE_SHIFT);
+}
+
+void __core_mmu_fence(core_t* /*core*/, uint32_t /*instr*/) {
+    // no-op for now
+}
+
+void __core_mmu_fetch(core_t* core, uint32_t addr, uint32_t* value) {
+    __core_mmu_translate(core, &addr,
+        (1 << 3),
+        (1 << 6),
+        false,
+        RISCV_EXC_FETCH_FAULT, RISCV_EXC_FETCH_PFAULT);
+    if (core->error) return;
+    core->mem_fetch(core, addr, value);
+}
+void __core_mmu_load(core_t* core, uint32_t addr, uint8_t width, uint32_t* value) {
+    __core_mmu_translate(core, &addr,
+        (1 << 1) | (core->sstatus_mxr ? (1 << 3) : 0),
+        (1 << 6),
+        core->sstatus_sum && core->s_mode,
+        RISCV_EXC_LOAD_FAULT, RISCV_EXC_LOAD_PFAULT);
+    if (core->error) return;
+    core->mem_load(core, addr, width, value);
+}
+void __core_mmu_store(core_t* core, uint32_t addr, uint8_t width, uint32_t value) {
+    __core_mmu_translate(core, &addr,
+        (1 << 2),
+        (1 << 6) | (1 << 7),
+        core->sstatus_sum && core->s_mode,
+        RISCV_EXC_STORE_FAULT, RISCV_EXC_STORE_PFAULT);
+    if (core->error) return;
+    core->mem_store(core, addr, width, value);
+}
+
+
 // EXCEPTIONS, TRAPS, INTERRUPTS
 
 void core_set_exception(core_t* core, uint32_t cause, uint32_t val) {
@@ -133,6 +254,10 @@ void __core_do_sret(core_t* core) {
 }
 
 void __core_do_privileged(core_t* core, uint32_t instr) {
+    if ((instr >> 25) == RISCV_PRIV___SFENCE_VMA) {
+        __core_mmu_fence(core, instr);
+        return;
+    }
     if (instr & ( (MASK(5) << 7) | (MASK(5) << 15) )) {
         core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0);
         return;
@@ -205,11 +330,10 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
             W(core->stvec_addr &= ~0b11;) \
             CSR_BITFIELD_BOOL(R, W, 0, core->stvec_vectored) \
         ) \
-        CSR_BITFIELD_CASE(R, W, RISCV_CSR_SATP, \
-            R(*value = core->satp_addr >> 12;) \
-            W(core->satp_addr = value << 12;) \
-            CSR_BITFIELD_BOOL(R, W, 31, core->stvec_vectored) \
-        ) \
+        case RISCV_CSR_SATP: \
+            R(*value = core->satp;) \
+            W(__core_mmu_set(core, value);) \
+            break; \
         REG_CASE_RW(R, W, RISCV_CSR_SCOUNTEREN, core->scounteren) \
         REG_CASE_RW(R, W, RISCV_CSR_SSCRATCH, core->sscratch) \
         REG_CASE_RW(R, W, RISCV_CSR_SEPC, core->sepc) \
@@ -331,7 +455,7 @@ void core_step(core_t* core) {
     }
 
     uint32_t instr;
-    core->mem_fetch(core, core->pc, &instr);
+    __core_mmu_fetch(core, core->pc, &instr);
     if (unlikely(core->error)) return;
 
     core->pc += 4;
@@ -362,12 +486,12 @@ void core_step(core_t* core) {
             break;
 
         case RISCV_I_LOAD:
-            core->mem_load(core, __core_read_rs1(core, instr) + __core_dec_i(instr), __core_dec_func3(instr), &value);
+            __core_mmu_load(core, __core_read_rs1(core, instr) + __core_dec_i(instr), __core_dec_func3(instr), &value);
             if (unlikely(core->error)) return;
             __core_set_dest(core, instr, value);
             break;
         case RISCV_I_STORE:
-            core->mem_store(core, __core_read_rs1(core, instr) + __core_dec_s(instr), __core_dec_func3(instr), __core_read_rs2(core, instr));
+            __core_mmu_store(core, __core_read_rs1(core, instr) + __core_dec_s(instr), __core_dec_func3(instr), __core_read_rs2(core, instr));
             if (unlikely(core->error)) return;
             break;
 

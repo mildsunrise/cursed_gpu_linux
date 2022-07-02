@@ -20,7 +20,7 @@
 #define MEM_CASE(func, width, code) \
     case (func): \
     if (unlikely((addr & ((width) - 1)))) { \
-        core_set_exception(core, exc_cause, addr); \
+        core_set_exception(core, exc_cause, core->exc_val); \
         break; \
     } \
     offset = (addr & 0b11) * 8; \
@@ -113,7 +113,7 @@ REG_FUNCTIONS(void u8250_reg, (u8250_state_t *uart, uint32_t addr), uint8_t, __u
         R(case RISCV_MEM_LH:) \
         W(case RISCV_MEM_SW:) \
         W(case RISCV_MEM_SH:) \
-            core_set_exception(core, R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN), addr); \
+            core_set_exception(core, R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN), core->exc_val); \
             return; \
         default: \
             core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
@@ -138,10 +138,18 @@ static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
     emu_state_t *data = (emu_state_t *)core->user_data;
     if (unlikely(addr >= RAM_SIZE)) {
         // FIXME: check for other regions
-        core_set_exception(core, RISCV_EXC_FETCH_FAULT, addr);
+        core_set_exception(core, RISCV_EXC_FETCH_FAULT, core->exc_val);
         return;
     }
     *value = data->ram[addr >> 2];
+}
+
+// similarly only main memory pages can be used as page_tables
+static uint32_t* mem_page_table(const core_t* core, uint32_t ppn) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+    if (ppn < (RAM_SIZE / RISCV_PAGE_SIZE))
+        return &data->ram[ppn << (RISCV_PAGE_SHIFT - 2)];
+    return NULL;
 }
 
 #define __mem_body(R, W) \
@@ -158,7 +166,7 @@ static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
                 REG_FUNC(R, W, u8250_wrap_mem)(core, &data->uart, addr & 0xFFF, width, value); return; \
         } \
     } \
-    core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), addr);
+    core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val);
 
 REG_FUNCTIONS(void mem, (core_t *core, uint32_t addr, uint8_t width), uint32_t, __mem_body)
 
@@ -189,6 +197,7 @@ int main() {
     core.mem_fetch = mem_fetch;
     core.mem_load = mem_read;
     core.mem_store = mem_write;
+    core.mem_page_table = mem_page_table;
 
     // set up RAM
     data.ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

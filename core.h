@@ -91,8 +91,8 @@ struct _core_t {
     bool stvec_vectored;
     uint32_t sscratch;    // misc
     uint32_t scounteren;
-    bool satp_enabled;    // MMU
-    uint32_t satp_addr;
+    uint32_t satp;        // MMU
+    uint32_t* page_table;
 
     // ENVIRONMENT SUPPLIED
     void* user_data;
@@ -100,6 +100,9 @@ struct _core_t {
     void (*mem_fetch)(core_t* core, uint32_t addr, uint32_t* value);
     void (*mem_load)(core_t* core, uint32_t addr, uint8_t width, uint32_t* value);
     void (*mem_store)(core_t* core, uint32_t addr, uint8_t width, uint32_t value);
+    // pre-validates that the required page number can hold a page table,
+    // and returns a uint32_t* to said page. if not valid, return NULL
+    uint32_t* (*mem_page_table)(const core_t* core, uint32_t ppn);
 };
 
 // (try to) emulate the next instruction. no-op if error is set.
