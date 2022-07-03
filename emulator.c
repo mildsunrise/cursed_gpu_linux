@@ -14,6 +14,12 @@
 #define unlikely(x) __builtin_expect((x),0)
 #define likely(x) __builtin_expect((x),1)
 
+#define SBI_IMPL_ID 0x999
+#define SBI_IMPL_VERSION 1
+#define RISCV_MVENDORID 0x12345678
+#define RISCV_MARCHID ((1 << 31) | 1)
+#define RISCV_MIMPID 1
+
 
 // main memory handlers (address must be relative, assumes it's within bounds)
 
@@ -171,6 +177,53 @@ static uint32_t* mem_page_table(const core_t* core, uint32_t ppn) {
 REG_FUNCTIONS(void mem, (core_t *core, uint32_t addr, uint8_t width), uint32_t, __mem_body)
 
 
+// SBI
+
+typedef struct {
+    int32_t error;
+    int32_t value;
+} sbiret_t;
+
+sbiret_t handle_sbi_ecall_BASE(core_t* core, int32_t fid) {
+    switch (fid) {
+        case SBI_BASE__GET_SBI_IMPL_ID:
+            return (sbiret_t){ SBI_SUCCESS, SBI_IMPL_ID };
+        case SBI_BASE__GET_SBI_IMPL_VERSION:
+            return (sbiret_t){ SBI_SUCCESS, SBI_IMPL_VERSION };
+        case SBI_BASE__GET_MVENDORID:
+            return (sbiret_t){ SBI_SUCCESS, RISCV_MVENDORID };
+        case SBI_BASE__GET_MARCHID:
+            return (sbiret_t){ SBI_SUCCESS, RISCV_MARCHID };
+        case SBI_BASE__GET_MIMPID:
+            return (sbiret_t){ SBI_SUCCESS, RISCV_MIMPID };
+        case SBI_BASE__GET_SBI_SPEC_VERSION:
+            return (sbiret_t){ SBI_SUCCESS, (0 << 24) | (3) }; // v0.3
+        case SBI_BASE__PROBE_EXTENSION:
+            int32_t eid = (int32_t)core->x_regs[RISCV_R_A0];
+            bool available = eid == SBI_EID_BASE;
+            return (sbiret_t){ SBI_SUCCESS, available };
+    }
+    return (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
+}
+
+#define __SBI_CASE(SLUG) \
+    case SBI_EID_ ## SLUG: \
+        ret = handle_sbi_ecall_ ## SLUG(core, core->x_regs[RISCV_R_A6]); break;
+
+void handle_sbi_ecall(core_t* core) {
+    sbiret_t ret;
+    switch (core->x_regs[RISCV_R_A7]) {
+        __SBI_CASE(BASE)
+        default:
+            ret = (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
+    }
+    core->x_regs[RISCV_R_A0] = (uint32_t)ret.error;
+    core->x_regs[RISCV_R_A1] = (uint32_t)ret.value;
+    // clear error to allow execution to continue
+    core->error = ERR_NONE;
+}
+
+
 // main emulation
 
 void read_file_into_ram(char** ram_cursor, const char* name) {
@@ -232,13 +285,17 @@ int main() {
         core_step(&core);
         if (likely(!core.error)) continue;
 
+        if (core.error == ERR_EXCEPTION && core.exc_cause == RISCV_EXC_ECALL_S) {
+            handle_sbi_ecall(&core);
+            continue;
+        }
+
         // for now, don't delegate any S-mode exceptions
         if (core.error == ERR_EXCEPTION && !core.s_mode) {
             core_trap(&core);
             continue;
         }
 
-        if (core.error == ERR_EXCEPTION && core.exc_cause == RISCV_EXC_ECALL_S) break;
         fprintf(stderr, "core error %s: %s. val=%#x\n", core_error_str(core.error), core_exc_cause_str(core.exc_cause), core.exc_val);
         return 2;
     }
