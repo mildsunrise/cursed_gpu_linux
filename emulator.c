@@ -209,7 +209,8 @@ int main() {
 
     char* ram_cursor = (char*) data.ram;
     read_file_into_ram(&ram_cursor, "linux/arch/riscv/boot/Image");
-    uint32_t dtb_addr = ((uint32_t)(ram_cursor - (char*)data.ram) & ~MASK(RISCV_PAGE_SHIFT)) + RISCV_PAGE_SIZE;
+    // load at last MB to prevent kernel / initrd from overwriting it
+    uint32_t dtb_addr = RAM_SIZE - 1024 * 1024;
     ram_cursor = ((char*)data.ram) + dtb_addr;
     read_file_into_ram(&ram_cursor, "linux_dtb");
 
