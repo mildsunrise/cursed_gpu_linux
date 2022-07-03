@@ -52,7 +52,7 @@ uint32_t __core_dec_i(uint32_t instr) {
 }
 uint32_t __core_dec_j(uint32_t instr) {
     int32_t sign = ((int32_t)instr) & (1 << 31);
-    return (uint32_t)(sign >> 12) |
+    return (uint32_t)(sign >> 11) |
         (instr & (MASK(8) << 12)) |
         ((instr & (MASK(1) << 20)) >> 9) |
         ((instr & (MASK(10) << 21)) >> 20);
