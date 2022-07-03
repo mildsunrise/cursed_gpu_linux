@@ -42,6 +42,15 @@
 #define RISCV_MEM_SH      0b001
 #define RISCV_MEM_SW      0b010
 
+#define RISCV_MUL_MUL     0b000
+#define RISCV_MUL_MULH    0b001
+#define RISCV_MUL_MULHSU  0b010
+#define RISCV_MUL_MULHU   0b011
+#define RISCV_MUL_DIV     0b100
+#define RISCV_MUL_DIVU    0b101
+#define RISCV_MUL_REM     0b110
+#define RISCV_MUL_REMU    0b111
+
 #define RISCV_AMO__W      0b010
 #define RISCV_AMO_LR      0b00010
 #define RISCV_AMO_SC      0b00011

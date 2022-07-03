@@ -412,7 +412,25 @@ void __core_do_system(core_t* core, uint32_t instr) {
 
 // UNPRIVILEGED INSTRUCTIONS
 
+uint32_t __core_mul_op(uint32_t instr, uint32_t a, uint32_t b) {
+    // FIXME: test ifunc7 zeros...
+    switch (__core_dec_func3(instr)) {
+        case RISCV_MUL_MUL: return a * b;
+        case RISCV_MUL_MULH: return (uint32_t)((uint64_t)( ((int64_t)(int32_t)a) * ((int64_t)(int32_t)b) ) >> 32);
+        case RISCV_MUL_MULHSU: return (uint32_t)((uint64_t)( ((int64_t)(int32_t)a) * ((int64_t)b) ) >> 32);
+        case RISCV_MUL_MULHU: return (uint32_t)(( ((uint64_t)a) * ((uint64_t)b) ) >> 32);
+
+        case RISCV_MUL_DIV: return b ? (uint32_t)( ((int32_t)a) / ((int32_t)b) ) : 0xFFFFFFFF;
+        case RISCV_MUL_DIVU: return b ? (a / b) : 0xFFFFFFFF;
+
+        case RISCV_MUL_REM: return b ? (uint32_t)( ((int32_t)a) % ((int32_t)b) ) : a;
+        case RISCV_MUL_REMU: return b ? (a % b) : a;
+    }
+    __builtin_unreachable();
+}
+
 uint32_t __core_int_op(uint32_t instr, bool isReg, uint32_t a, uint32_t b) {
+    // FIXME: test ifunc7 zeros...
     switch (__core_dec_func3(instr)) {
         case RISCV_IFUNC_ADD:  return a + ((isReg && __negBit) ? -b : b);
 
@@ -534,7 +552,11 @@ void core_step(core_t* core) {
         case RISCV_I_OP_IMM:
             __core_set_dest(core, instr, __core_int_op(instr, false, __core_read_rs1(core, instr), __core_dec_i(instr))); break;
         case RISCV_I_OP:
-            __core_set_dest(core, instr, __core_int_op(instr, true, __core_read_rs1(core, instr), __core_read_rs2(core, instr))); break;
+            if (!(instr & (1 << 25)))
+                __core_set_dest(core, instr, __core_int_op(instr, true, __core_read_rs1(core, instr), __core_read_rs2(core, instr)));
+            else
+                __core_set_dest(core, instr, __core_mul_op(instr,       __core_read_rs1(core, instr), __core_read_rs2(core, instr)));
+            break;
 
         case RISCV_I_LUI:
             __core_set_dest(core, instr, __core_dec_u(instr)); break;
