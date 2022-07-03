@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
 
     core.pc = ehdr.e_entry;
     assert(!(core.pc & 0b11));
-    core.x_regs[2] = STACK_INITIAL;
+    core.x_regs[RISCV_R_SP] = STACK_INITIAL;
 
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);

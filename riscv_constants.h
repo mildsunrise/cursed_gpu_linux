@@ -79,6 +79,40 @@
 #define RISCV_PRIV_WFI    0b000100000101
 #define RISCV_PRIV___SFENCE_VMA 0b0001001
 
+#define RISCV_R_ZERO 0
+#define RISCV_R_RA   1
+#define RISCV_R_SP   2
+#define RISCV_R_GP   3
+#define RISCV_R_TP   4
+#define RISCV_R_T0   5
+#define RISCV_R_T1   6
+#define RISCV_R_T2   7
+#define RISCV_R_S0   8
+#define RISCV_R_S1   9
+#define RISCV_R_A0   10
+#define RISCV_R_A1   11
+#define RISCV_R_A2   12
+#define RISCV_R_A3   13
+#define RISCV_R_A4   14
+#define RISCV_R_A5   15
+#define RISCV_R_A6   16
+#define RISCV_R_A7   17
+#define RISCV_R_S2   18
+#define RISCV_R_S3   19
+#define RISCV_R_S4   20
+#define RISCV_R_S5   21
+#define RISCV_R_S6   22
+#define RISCV_R_S7   23
+#define RISCV_R_S8   24
+#define RISCV_R_S9   25
+#define RISCV_R_S10  26
+#define RISCV_R_S11  27
+#define RISCV_R_T3   28
+#define RISCV_R_T4   29
+#define RISCV_R_T5   30
+#define RISCV_R_T6   31
+#define RISCV_R_FP   8
+
 
 // privileged ISA: CSRs
 

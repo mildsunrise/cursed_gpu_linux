@@ -215,8 +215,8 @@ int main() {
     read_file_into_ram(&ram_cursor, "linux_dtb");
 
     core.s_mode = true;
-    core.x_regs[10] = 0; // hart ID (cpuid)
-    core.x_regs[11] = dtb_addr; // FIXME: does it get overwritten?
+    core.x_regs[RISCV_R_A0] = 0; // hart ID (cpuid)
+    core.x_regs[RISCV_R_A1] = dtb_addr; // FIXME: does it get overwritten?
 
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);
@@ -228,7 +228,7 @@ int main() {
     ioctl(instr_count_fd, PERF_EVENT_IOC_ENABLE, 0);
 
     while (1) {
-        //printf("pc: %#08x, sp: %#08x\n", core.pc, core.x_regs[2]);
+        //printf("pc: %#08x, sp: %#08x\n", core.pc, core.x_regs[RISCV_R_SP]);
         core_step(&core);
         if (likely(!core.error)) continue;
 
