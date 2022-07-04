@@ -5,6 +5,10 @@
 	#size-cells = <1>;
 	model = "mild_sunrise,cursed_gpu_emulator";
 
+	aliases {
+		serial0 = "/soc/serial@0";
+	};
+
 	chosen {
 		bootargs = "earlycon console=ttyS0";
 		stdout-path = "serial0";
@@ -40,8 +44,8 @@
 		compatible = "simple-bus";
 		ranges = <0x0 0xF0000000 0x00010000>;
 
-		serial0: serial@0 {
-			compatible = "ns8250";
+		serial@0 {
+			compatible = "ns16550";
 			reg = <0x0000 0x1000>;
 			no-loopback-test;
 			clock-frequency = <5000000>; /* fake, since we ignore the baudrate divisor */
