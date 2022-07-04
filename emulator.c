@@ -136,6 +136,8 @@ REG_FUNCTIONS(void u8250_wrap_mem, (core_t *core, u8250_state_t *uart, uint32_t 
 typedef struct {
     uint32_t *ram;
     u8250_state_t uart;
+    uint32_t timer_l;
+    uint32_t timer_h;
 } emu_state_t;
 
 // we define fetch separately because it's much simpler (width is fixed,
@@ -184,6 +186,17 @@ typedef struct {
     int32_t value;
 } sbiret_t;
 
+sbiret_t handle_sbi_ecall_TIMER(core_t* core, int32_t fid) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+    switch (fid) {
+        case SBI_TIMER__SET_TIMER:
+            data->timer_l = core->x_regs[RISCV_R_A0];
+            data->timer_h = core->x_regs[RISCV_R_A1];
+            return (sbiret_t){ SBI_SUCCESS, 0 };
+    }
+    return (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
+}
+
 sbiret_t handle_sbi_ecall_BASE(core_t* core, int32_t fid) {
     switch (fid) {
         case SBI_BASE__GET_SBI_IMPL_ID:
@@ -200,7 +213,7 @@ sbiret_t handle_sbi_ecall_BASE(core_t* core, int32_t fid) {
             return (sbiret_t){ SBI_SUCCESS, (0 << 24) | (3) }; // v0.3
         case SBI_BASE__PROBE_EXTENSION:
             int32_t eid = (int32_t)core->x_regs[RISCV_R_A0];
-            bool available = eid == SBI_EID_BASE;
+            bool available = eid == SBI_EID_BASE || eid == SBI_EID_TIMER;
             return (sbiret_t){ SBI_SUCCESS, available };
     }
     return (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
@@ -214,6 +227,7 @@ void handle_sbi_ecall(core_t* core) {
     sbiret_t ret;
     switch (core->x_regs[RISCV_R_A7]) {
         __SBI_CASE(BASE)
+        __SBI_CASE(TIMER)
         default:
             ret = (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
     }
@@ -267,6 +281,7 @@ int main() {
     ram_cursor = ((char*)data.ram) + dtb_addr;
     read_file_into_ram(&ram_cursor, "linux_dtb");
 
+    data.timer_h = data.timer_l = 0xFFFFFFFF;
     core.s_mode = true;
     core.x_regs[RISCV_R_A0] = 0; // hart ID (cpuid)
     core.x_regs[RISCV_R_A1] = dtb_addr; // FIXME: does it get overwritten?
@@ -282,6 +297,10 @@ int main() {
 
     while (1) {
         //printf("pc: %#08x, sp: %#08x\n", core.pc, core.x_regs[RISCV_R_SP]);
+
+        bool timer_active = core.instr_count_h > data.timer_h || (core.instr_count_h == data.timer_h && core.instr_count > data.timer_l);
+        timer_active ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
+
         core_step(&core);
         if (likely(!core.error)) continue;
 
