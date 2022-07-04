@@ -44,6 +44,7 @@
 			compatible = "ns8250";
 			reg = <0x0000 0x1000>;
 			no-loopback-test;
+			clock-frequency = <5000000>; /* fake, since we ignore the baudrate divisor */
 		};
 	};
 };

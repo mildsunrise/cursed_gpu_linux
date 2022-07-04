@@ -59,7 +59,7 @@ uint32_t __core_dec_j(uint32_t instr) {
 }
 uint32_t __core_dec_b(uint32_t instr) {
     int32_t sign = ((int32_t)instr) & (1 << 31);
-    return (uint32_t)(sign >> 20) |
+    return (uint32_t)(sign >> 19) |
         ((instr & (MASK(4) << 8)) >> 7) |
         ((instr & (MASK(1) << 7)) << 4) |
         ((instr & (MASK(6) << 25)) >> 20);
@@ -256,7 +256,7 @@ void core_trap(core_t* core) {
     core->s_mode = true;
     core->pc = core->stvec_addr;
     if (core->stvec_vectored)
-        core->pc += core->scause * 4;
+        core->pc += (core->scause & MASK(31)) * 4;
 
     core->error = ERR_NONE;
 }
@@ -315,7 +315,7 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
     R( \
         if ((addr >> 8) == 0xC) { \
             uint16_t idx = addr & MASK(7); \
-            if (idx >= 0x20 || !((core->scounteren >> idx) & 1)) \
+            if (idx >= 0x20 || !( core->s_mode || ((core->scounteren >> idx) & 1) )) \
                 core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
             else \
                 /* we'll use the instruction counter for all of the counters. ideally,
