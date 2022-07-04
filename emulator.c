@@ -76,7 +76,7 @@ typedef struct {
         case 0: \
             if (uart->lcr & (1 << 7)) /* DLAB */ \
                 { REG_LVALUE(R, W, uart->dll); break; } \
-            W(printf("incoming character on UART: %u\n", value);) /* FIXME */ \
+            W(putc(value, stdout);) /* FIXME */ \
             R(*value = 0;) \
             break; \
         case 1: \
@@ -295,6 +295,7 @@ int main() {
     ioctl(cycle_count_fd, PERF_EVENT_IOC_ENABLE, 0);
     ioctl(instr_count_fd, PERF_EVENT_IOC_ENABLE, 0);
 
+    int trap_idx = 0;
     while (1) {
         //printf("pc: %#08x, sp: %#08x\n", core.pc, core.x_regs[RISCV_R_SP]);
 
@@ -310,7 +311,7 @@ int main() {
         }
 
         // for now, don't delegate any S-mode exceptions
-        if (core.error == ERR_EXCEPTION && !core.s_mode) {
+        if (core.error == ERR_EXCEPTION && (!core.s_mode || (  trap_idx++ < 1  ))) {
             core_trap(&core);
             continue;
         }
