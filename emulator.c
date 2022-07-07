@@ -60,6 +60,11 @@ REG_FUNCTIONS(void main_mem, (core_t* core, uint32_t* mem, uint32_t addr, uint8_
 
 // emulate 8250 (plain, without loopback mode support)
 
+#define U8250_INT_MS   0
+#define U8250_INT_THRE 1
+#define U8250_INT_RDA  2
+#define U8250_INT_LS   3
+
 typedef struct {
     // divisor (ignored)
     uint8_t dll, dlh;
@@ -67,9 +72,22 @@ typedef struct {
     uint8_t lcr;
     // interrupt config (basically just bit 1)
     uint8_t ier;
+    // interrupt status
+    uint8_t current_int;
+    uint8_t pending_ints;
     // other output signals, loopback mode (ignored)
     uint8_t mcr;
 } u8250_state_t;
+
+void u8250_update_interrupts(u8250_state_t *uart) {
+    // prevent generating any disabled interrupts in the first place
+    uart->pending_ints &= uart->ier;
+    // update current interrupt (higher bits -> more priority)
+    if (uart->pending_ints) {
+        uart->current_int = 8;
+        while (!(uart->pending_ints & (1 << --uart->current_int))); // FIXME: use a LUT
+    }
+}
 
 #define __u8250_body(R, W) \
     switch (addr) { \
@@ -77,14 +95,20 @@ typedef struct {
             if (uart->lcr & (1 << 7)) /* DLAB */ \
                 { REG_LVALUE(R, W, uart->dll); break; } \
             W(putc(value, stdout);) /* FIXME */ \
+            W(uart->pending_ints |= 1 << U8250_INT_THRE;) \
             R(*value = 0;) \
             break; \
         case 1: \
             if (uart->lcr & (1 << 7)) /* DLAB */ \
                 { REG_LVALUE(R, W, uart->dlh); break; } \
-            REG_LVALUE(R, W, uart->ier); /* FIXME: support THE interrupt */ \
+            REG_LVALUE(R, W, uart->ier); \
             break; \
-        REG_CASE_RO(R, W, 2, 0x01) /* IIR = no pending interrupt */ \
+        R(case 2: \
+            *value = (uart->current_int << 1) | (uart->pending_ints ? 0 : 1); \
+            if (uart->current_int == U8250_INT_THRE) \
+                uart->pending_ints &= ~(1 << uart->current_int); \
+            break; \
+        ) \
         REG_CASE_RW(R, W, 3, uart->lcr) \
         REG_CASE_RW(R, W, 4, uart->mcr) \
         REG_CASE_RO(R, W, 5, 0x60) /* LSR = no error, TX done & ready */ \
@@ -207,6 +231,9 @@ REG_FUNCTIONS(void plic_wrap_mem, (core_t *core, plic_state_t *plic, uint32_t ad
 
 #define RAM_SIZE (512 * 1024 * 1024)
 
+#define IRQ_UART 1
+#define IRQ_UART_BIT (1 << IRQ_UART)
+
 typedef struct {
     uint32_t *ram;
     plic_state_t plic;
@@ -251,6 +278,9 @@ static uint32_t* mem_page_table(const core_t* core, uint32_t ppn) {
                 return; \
             case 0x40: /* UART */ \
                 REG_FUNC(R, W, u8250_wrap_mem)(core, &data->uart, addr & 0xFFFFF, width, value); \
+                u8250_update_interrupts(&data->uart); \
+                data->uart.pending_ints ? (data->plic.active |= IRQ_UART_BIT) : (data->plic.active &= ~IRQ_UART_BIT); \
+                plic_update_interrupts(core, &data->plic); \
                 return; \
         } \
     } \
