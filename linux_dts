@@ -6,7 +6,7 @@
 	model = "mild_sunrise,cursed_gpu_emulator";
 
 	aliases {
-		serial0 = "/soc/serial@0";
+		serial0 = "/soc/serial@4000000";
 	};
 
 	chosen {
@@ -42,11 +42,22 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 		compatible = "simple-bus";
-		ranges = <0x0 0xF0000000 0x00010000>;
+		ranges = <0x0 0xF0000000 0x10000000>;
+		interrupt-parent = <&plic0>;
 
-		serial@0 {
+		plic0: interrupt-controller@0 {
+			#interrupt-cells = <1>;
+			#address-cells = <0>;
+			compatible = "sifive,plic-1.0.0";
+			reg = <0x0000000 0x4000000>;
+			interrupt-controller;
+			interrupts-extended = <&cpu0_intc 9>;
+			riscv,ndev = <31>;
+		};
+
+		serial@4000000 {
 			compatible = "ns16550";
-			reg = <0x0000 0x1000>;
+			reg = <0x4000000 0x100000>;
 			no-loopback-test;
 			clock-frequency = <5000000>; /* fake, since we ignore the baudrate divisor */
 		};

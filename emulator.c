@@ -129,12 +129,87 @@ REG_FUNCTIONS(void u8250_reg, (u8250_state_t *uart, uint32_t addr), uint8_t, __u
 REG_FUNCTIONS(void u8250_wrap_mem, (core_t *core, u8250_state_t *uart, uint32_t addr, uint8_t width), uint32_t, __u8250_wrap_body)
 
 
+// PLIC
+// we want it to be simple so: 32 interrupts, no priority
+
+typedef struct {
+    uint32_t masked;
+    uint32_t ip;
+    uint32_t ie;
+    // state of input interrupt lines (level-triggered), set by environment
+    uint32_t active;
+} plic_state_t;
+
+void plic_update_interrupts(core_t* core, plic_state_t* plic) {
+    // update pending interrupts
+    plic->ip |= plic->active & ~plic->masked;
+    plic->masked |= plic->active;
+    // send interrupt to target
+    (plic->ip & plic->ie) ? (core->sip |= RISCV_INT_SEI_BIT) : (core->sip &= ~RISCV_INT_SEI_BIT);
+}
+
+#define __plic_body(R, W) \
+    switch (addr) { \
+        case  1: case  2: case  3: case  4: case  5: case  6: case  7: case  8: case  9: case 10: \
+        case 11: case 12: case 13: case 14: case 15: case 16: case 17: case 18: case 19: case 20: \
+        case 21: case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29: case 30: case 31: \
+            R(*value = 1;) return true; /* no priority support -> source priority hardwired to 1 */ \
+        R(case 0x400: *value = plic->ip; return true;) \
+        case 0x800: \
+            W(value &= ~1;) \
+            REG_LVALUE(R, W, plic->ie); \
+            return true; \
+        case 0x80000: \
+            R(*value = 0;) return true; /* no priority support -> target priority threshold hardwired to 0 */ \
+        case 0x80001: \
+            R( /* claim */ \
+                *value = 0; \
+                uint32_t candidates = plic->ip & plic->ie; \
+                if (candidates) { \
+                    while (!( candidates & (1 << (++(*value))) )); \
+                    plic->ip &= ~(1 << (*value)); \
+                } \
+            ) \
+            W( /* completion */ \
+                if (plic->ie & (1 << value)) \
+                    plic->masked &= ~(1 << value); \
+            ) \
+            return true; \
+        default: return false; \
+    }
+
+REG_FUNCTIONS(bool plic_reg, (plic_state_t *plic, uint32_t addr), uint32_t, __plic_body)
+
+// we still need a wrapper for memory accesses
+#define __plic_wrap_body(R, W) \
+    switch (width) { \
+        case R(RISCV_MEM_LW) W(RISCV_MEM_SW): \
+            if (!REG_FUNC(R, W, plic_reg)(plic, addr >> 2, value)) \
+                core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val); \
+            break; \
+        R(case RISCV_MEM_LBU:) \
+        R(case RISCV_MEM_LB:) \
+        R(case RISCV_MEM_LHU:) \
+        R(case RISCV_MEM_LH:) \
+        W(case RISCV_MEM_SB:) \
+        W(case RISCV_MEM_SH:) \
+            core_set_exception(core, R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN), core->exc_val); \
+            return; \
+        default: \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
+            return; \
+    }
+
+REG_FUNCTIONS(void plic_wrap_mem, (core_t *core, plic_state_t *plic, uint32_t addr, uint8_t width), uint32_t, __plic_wrap_body)
+
+
 // memory mapping
 
 #define RAM_SIZE (512 * 1024 * 1024)
 
 typedef struct {
     uint32_t *ram;
+    plic_state_t plic;
     u8250_state_t uart;
     uint32_t timer_l;
     uint32_t timer_h;
@@ -166,12 +241,17 @@ static uint32_t* mem_page_table(const core_t* core, uint32_t ppn) {
     if (addr < RAM_SIZE) { \
         REG_FUNC(R, W, main_mem)(core, data->ram, addr, width, value); return; \
     } \
-    /* MMIO at 0xF000____ */ \
-    if ((addr & 0xFFFF0000) == 0xF0000000) { \
-        /* 16 regions of 4kiB */ \
-        switch ((addr & 0xF000) >> 12) { \
-            case 0: /* UART */ \
-                REG_FUNC(R, W, u8250_wrap_mem)(core, &data->uart, addr & 0xFFF, width, value); return; \
+    /* MMIO at 0xF_______ */ \
+    if ((addr >> 28) == 0xF) { \
+        /* 256 regions of 1MiB */ \
+        switch ((addr >> 20) & MASK(8)) { \
+            case 0x0: case 0x2: /* PLIC (0 - 0x3F) */ \
+                REG_FUNC(R, W, plic_wrap_mem)(core, &data->plic, addr & 0x3FFFFFF, width, value); \
+                plic_update_interrupts(core, &data->plic); \
+                return; \
+            case 0x40: /* UART */ \
+                REG_FUNC(R, W, u8250_wrap_mem)(core, &data->uart, addr & 0xFFFFF, width, value); \
+                return; \
         } \
     } \
     core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val);
