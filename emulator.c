@@ -94,7 +94,7 @@ void u8250_update_interrupts(u8250_state_t *uart) {
         case 0: \
             if (uart->lcr & (1 << 7)) /* DLAB */ \
                 { REG_LVALUE(R, W, uart->dll); break; } \
-            W(putc(value, stdout);) /* FIXME */ \
+            W(putc(value, stdout); fflush(stdout);) /* FIXME */ \
             W(uart->pending_ints |= 1 << U8250_INT_THRE;) \
             R(*value = 0;) \
             break; \
@@ -405,7 +405,6 @@ int main() {
     ioctl(cycle_count_fd, PERF_EVENT_IOC_ENABLE, 0);
     ioctl(instr_count_fd, PERF_EVENT_IOC_ENABLE, 0);
 
-    int trap_idx = 0;
     while (1) {
         //printf("pc: %#08x, sp: %#08x\n", core.pc, core.x_regs[RISCV_R_SP]);
 
@@ -421,7 +420,7 @@ int main() {
         }
 
         // for now, don't delegate any S-mode exceptions
-        if (core.error == ERR_EXCEPTION && (!core.s_mode || (  trap_idx++ < 1  ))) {
+        if (core.error == ERR_EXCEPTION) {
             core_trap(&core);
             continue;
         }

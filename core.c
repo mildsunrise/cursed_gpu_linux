@@ -288,6 +288,8 @@ void __core_do_privileged(core_t* core, uint32_t instr) {
             core_set_exception(core, core->s_mode ? RISCV_EXC_ECALL_S : RISCV_EXC_ECALL_U, 0); break;
         case RISCV_PRIV_SRET:
             __core_do_sret(core); break;
+        case RISCV_PRIV_WFI:
+            break; // FIXME
         default:
             core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); break;
     }
