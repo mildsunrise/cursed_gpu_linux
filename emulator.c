@@ -8,6 +8,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
 #include "measure.c"
 
 #define MASK(n) (~((~0U << (n))))
@@ -77,9 +80,14 @@ typedef struct {
     uint8_t pending_ints;
     // other output signals, loopback mode (ignored)
     uint8_t mcr;
+    // I/O handling
+    int in_fd, out_fd;
+    bool in_ready;
 } u8250_state_t;
 
 void u8250_update_interrupts(u8250_state_t *uart) {
+    // some interrupts are level-generated
+    uart->in_ready ? (uart->pending_ints |= 1) : (uart->pending_ints &= ~1); // FIXME: does this also generate an LSR change interrupt?
     // prevent generating any disabled interrupts in the first place
     uart->pending_ints &= uart->ier;
     // update current interrupt (higher bits -> more priority)
@@ -89,14 +97,37 @@ void u8250_update_interrupts(u8250_state_t *uart) {
     }
 }
 
+void u8250_check_ready(u8250_state_t* uart) {
+    if (uart->in_ready) return; // no need to check
+    struct pollfd pfd = { uart->in_fd, POLLIN, 0 };
+    poll(&pfd, 1, 0);
+    if (pfd.revents & POLLIN) uart->in_ready = true;
+}
+
+void u8250_handle_out(u8250_state_t* uart, uint8_t value) {
+    if (write(uart->out_fd, &value, 1) < 1)
+        fprintf(stderr, "failed to write UART output: %s\n", strerror(errno));
+}
+
+uint8_t u8250_handle_in(u8250_state_t* uart) {
+    uint8_t value = 0;
+    u8250_check_ready(uart);
+    if (!uart->in_ready) return value;
+    if (read(uart->in_fd, &value, 1) < 0)
+        fprintf(stderr, "failed to read UART input: %s\n", strerror(errno));
+    uart->in_ready = false;
+    u8250_check_ready(uart);
+    return value;
+}
+
 #define __u8250_body(R, W) \
     switch (addr) { \
         case 0: \
             if (uart->lcr & (1 << 7)) /* DLAB */ \
                 { REG_LVALUE(R, W, uart->dll); break; } \
-            W(putc(value, stdout); fflush(stdout);) /* FIXME */ \
+            W(u8250_handle_out(uart, value);) \
             W(uart->pending_ints |= 1 << U8250_INT_THRE;) \
-            R(*value = 0;) \
+            R(*value = u8250_handle_in(uart);) \
             break; \
         case 1: \
             if (uart->lcr & (1 << 7)) /* DLAB */ \
@@ -111,7 +142,7 @@ void u8250_update_interrupts(u8250_state_t *uart) {
         ) \
         REG_CASE_RW(R, W, 3, uart->lcr) \
         REG_CASE_RW(R, W, 4, uart->mcr) \
-        REG_CASE_RO(R, W, 5, 0x60) /* LSR = no error, TX done & ready */ \
+        REG_CASE_RO(R, W, 5, 0x60 | (uart->in_ready ? 1 : 0)) /* LSR = no error, TX done & ready */ \
         REG_CASE_RO(R, W, 6, 0xb0) /* MSR = carrier detect, no ring, data ready, clear to send */ \
         /* no scratch register, so we should be detected as a plain 8250 */ \
         R(default: *value = 0;) \
@@ -262,6 +293,13 @@ static uint32_t* mem_page_table(const core_t* core, uint32_t ppn) {
     return NULL;
 }
 
+void emulator_update_uart_interrupts(core_t* core) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+    u8250_update_interrupts(&data->uart);
+    data->uart.pending_ints ? (data->plic.active |= IRQ_UART_BIT) : (data->plic.active &= ~IRQ_UART_BIT);
+    plic_update_interrupts(core, &data->plic);
+}
+
 #define __mem_body(R, W) \
     emu_state_t *data = (emu_state_t *)core->user_data; \
     /* RAM at 0x00000000 + RAM_SIZE */ \
@@ -278,9 +316,7 @@ static uint32_t* mem_page_table(const core_t* core, uint32_t ppn) {
                 return; \
             case 0x40: /* UART */ \
                 REG_FUNC(R, W, u8250_wrap_mem)(core, &data->uart, addr & 0xFFFFF, width, value); \
-                u8250_update_interrupts(&data->uart); \
-                data->uart.pending_ints ? (data->plic.active |= IRQ_UART_BIT) : (data->plic.active &= ~IRQ_UART_BIT); \
-                plic_update_interrupts(core, &data->plic); \
+                emulator_update_uart_interrupts(core); \
                 return; \
         } \
     } \
@@ -391,6 +427,9 @@ int main() {
     ram_cursor = ((char*)data.ram) + dtb_addr;
     read_file_into_ram(&ram_cursor, "linux_dtb");
 
+    data.uart.in_fd = 0;
+    data.uart.out_fd = 1;
+
     data.timer_h = data.timer_l = 0xFFFFFFFF;
     core.s_mode = true;
     core.x_regs[RISCV_R_A0] = 0; // hart ID (cpuid)
@@ -405,8 +444,16 @@ int main() {
     ioctl(cycle_count_fd, PERF_EVENT_IOC_ENABLE, 0);
     ioctl(instr_count_fd, PERF_EVENT_IOC_ENABLE, 0);
 
+    uint32_t interrupt_check_ctr = 0;
     while (1) {
         //printf("pc: %#08x, sp: %#08x\n", core.pc, core.x_regs[RISCV_R_SP]);
+
+        if (interrupt_check_ctr-- == 0) {
+            interrupt_check_ctr = 64;
+            u8250_check_ready(&data.uart);
+            if (data.uart.in_ready)
+                emulator_update_uart_interrupts(&core);
+        }
 
         bool timer_active = core.instr_count_h > data.timer_h || (core.instr_count_h == data.timer_h && core.instr_count > data.timer_l);
         timer_active ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
