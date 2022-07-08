@@ -394,7 +394,7 @@ int main() {
     data.timer_h = data.timer_l = 0xFFFFFFFF;
     core.s_mode = true;
     core.x_regs[RISCV_R_A0] = 0; // hart ID (cpuid)
-    core.x_regs[RISCV_R_A1] = dtb_addr; // FIXME: does it get overwritten?
+    core.x_regs[RISCV_R_A1] = dtb_addr;
 
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);
@@ -419,7 +419,6 @@ int main() {
             continue;
         }
 
-        // for now, don't delegate any S-mode exceptions
         if (core.error == ERR_EXCEPTION) {
             core_trap(&core);
             continue;
