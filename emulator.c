@@ -266,6 +266,7 @@ REG_FUNCTIONS(void plic_wrap_mem, (core_t *core, plic_state_t *plic, uint32_t ad
 #define IRQ_UART_BIT (1 << IRQ_UART)
 
 typedef struct {
+    bool stopped;
     uint32_t *ram;
     plic_state_t plic;
     u8250_state_t uart;
@@ -343,6 +344,17 @@ sbiret_t handle_sbi_ecall_TIMER(core_t* core, int32_t fid) {
     return (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
 }
 
+sbiret_t handle_sbi_ecall_RST(core_t* core, int32_t fid) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+    switch (fid) {
+        case SBI_RST__SYSTEM_RESET:
+            fprintf(stderr, "system reset: type=%u, reason=%u\n", core->x_regs[RISCV_R_A0], core->x_regs[RISCV_R_A1]);
+            data->stopped = true;
+            return (sbiret_t){ SBI_SUCCESS, 0 };
+    }
+    return (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
+}
+
 sbiret_t handle_sbi_ecall_BASE(core_t* core, int32_t fid) {
     switch (fid) {
         case SBI_BASE__GET_SBI_IMPL_ID:
@@ -359,7 +371,7 @@ sbiret_t handle_sbi_ecall_BASE(core_t* core, int32_t fid) {
             return (sbiret_t){ SBI_SUCCESS, (0 << 24) | (3) }; // v0.3
         case SBI_BASE__PROBE_EXTENSION:
             int32_t eid = (int32_t)core->x_regs[RISCV_R_A0];
-            bool available = eid == SBI_EID_BASE || eid == SBI_EID_TIMER;
+            bool available = eid == SBI_EID_BASE || eid == SBI_EID_TIMER || eid == SBI_EID_RST;
             return (sbiret_t){ SBI_SUCCESS, available };
     }
     return (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
@@ -374,6 +386,7 @@ void handle_sbi_ecall(core_t* core) {
     switch (core->x_regs[RISCV_R_A7]) {
         __SBI_CASE(BASE)
         __SBI_CASE(TIMER)
+        __SBI_CASE(RST)
         default:
             ret = (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
     }
@@ -445,7 +458,7 @@ int main() {
     ioctl(instr_count_fd, PERF_EVENT_IOC_ENABLE, 0);
 
     uint32_t interrupt_check_ctr = 0;
-    while (1) {
+    while (!data.stopped) {
         //printf("pc: %#08x, sp: %#08x\n", core.pc, core.x_regs[RISCV_R_SP]);
 
         if (interrupt_check_ctr-- == 0) {
@@ -483,9 +496,9 @@ int main() {
     int64_t elapsed = ((int64_t)end.tv_sec - (int64_t)start.tv_sec) * 1000000000 + ((int64_t)end.tv_nsec - (int64_t)start.tv_nsec);
     long long host_instr_count = simple_perf_read(instr_count_fd);
     long long host_cycle_count = simple_perf_read(cycle_count_fd);
-    printf("executed %u instructions in %.3f ms, %lld instructions, %lld cycles\n",
+    fprintf(stderr, "executed %u instructions in %.3f ms, %lld instructions, %lld cycles\n",
         core.instr_count, elapsed / 1e6, host_instr_count, host_cycle_count);
-    printf("stats: %.3f c/i, %.1f i/I, %.1f c/I, %.1f MIps\n",
+    fprintf(stderr, "stats: %.3f c/i, %.1f i/I, %.1f c/I, %.1f MIps\n",
         ((double)host_cycle_count) / ((double)host_instr_count),
         ((double)host_instr_count) / ((double)core.instr_count),
         ((double)host_cycle_count) / ((double)core.instr_count),
