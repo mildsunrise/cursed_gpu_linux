@@ -11,6 +11,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <sys/uio.h>
 #include "measure.c"
 
 #define MASK(n) (~((~0U << (n))))
@@ -22,6 +25,12 @@
 #define RISCV_MVENDORID 0x12345678
 #define RISCV_MARCHID ((1 << 31) | 1)
 #define RISCV_MIMPID 1
+#define VIRTIO_VENDOR_ID 0x12345678
+
+// should be defined under "memory mapping", but defined here because of dependencies
+#define RAM_SIZE (512 * 1024 * 1024)
+
+#define TAP_INTERFACE "tap%d"
 
 
 // main memory handlers (address must be relative, assumes it's within bounds)
@@ -184,6 +193,321 @@ REG_FUNCTIONS(void u8250_reg, (u8250_state_t *uart, uint32_t addr), uint8_t, __u
 REG_FUNCTIONS(void u8250_wrap_mem, (core_t *core, u8250_state_t *uart, uint32_t addr, uint8_t width), uint32_t, __u8250_wrap_body)
 
 
+// VIRTIO-NET (no extra features. just the basics)
+
+typedef struct {
+    uint32_t QueueNum;
+    uint32_t QueueDesc;
+    uint32_t QueueAvail;
+    uint32_t QueueUsed;
+    uint16_t last_avail;
+    bool ready;
+    bool fd_ready;
+} virtionet_queue_t;
+
+typedef struct {
+    // feature negotiation
+    uint32_t DeviceFeaturesSel;
+    uint32_t DriverFeatures;
+    uint32_t DriverFeaturesSel;
+    // queue config
+    uint32_t QueueSel;
+    virtionet_queue_t queues [2];
+    // status
+    uint32_t Status;
+    uint32_t InterruptStatus;
+    // supplied by environment
+    int tap_fd;
+    uint32_t* ram;
+} virtionet_state_t;
+
+#define VIRTIO_STATUS__ACKNOWLEDGE           1
+#define VIRTIO_STATUS__DRIVER                2
+#define VIRTIO_STATUS__FAILED              128
+#define VIRTIO_STATUS__FEATURES_OK           8
+#define VIRTIO_STATUS__DRIVER_OK             4
+#define VIRTIO_STATUS__DEVICE_NEEDS_RESET   64
+
+#define VIRTIO_INT__USED_RING   1
+#define VIRTIO_INT__CONF_CHANGE 2
+
+#define VIRTIO_DESC_F_NEXT      1
+#define VIRTIO_DESC_F_WRITE     2
+#define VIRTIO_DESC_F_INDIRECT  4
+
+#define __VNET_FEATURES_0 0
+#define __VNET_FEATURES_1 1 // VIRTIO_F_VERSION_1
+#define __VNET_QUEUE_NUM_MAX 1024
+#define __VNET_QUEUE (vnet->queues[vnet->QueueSel])
+
+#define __VNET_PREPROCESS_ADDR(addr) ((addr) < RAM_SIZE && !((addr) & 0b11) ? ((addr) >> 2) : (virtionet_set_fail(vnet), 0))
+
+#define __VNET_QUEUE_RX 0
+#define __VNET_QUEUE_TX 1
+
+void virtionet_set_fail(virtionet_state_t* vnet) {
+    vnet->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
+    if (vnet->Status & VIRTIO_STATUS__DRIVER_OK)
+        vnet->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+}
+
+void virtionet_update_status(virtionet_state_t* vnet, uint32_t status) {
+    vnet->Status |= status;
+    if (!status) { // reset
+        int tap_fd = vnet->tap_fd;
+        uint32_t* ram = vnet->ram;
+        memset(vnet, 0, sizeof(*vnet));
+        vnet->tap_fd = tap_fd;
+        vnet->ram = ram;
+    }
+}
+
+bool __vnet_iovec_write(struct iovec** vecs, size_t* nvecs, const uint8_t* src, size_t n) {
+    while (n && *nvecs) {
+        if (n < (*vecs)->iov_len) {
+            memcpy((*vecs)->iov_base, src, n);
+            (*vecs)->iov_base = ((char*)(*vecs)->iov_base) + n;
+            (*vecs)->iov_len -= n;
+            return true;
+        }
+        memcpy((*vecs)->iov_base, src, (*vecs)->iov_len);
+        src += (*vecs)->iov_len; n -= (*vecs)->iov_len;
+        (*vecs)++; (*nvecs)--;
+    }
+    return n && !*nvecs;
+}
+
+bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t n) {
+    while (n && *nvecs) {
+        if (n < (*vecs)->iov_len) {
+            memcpy(dst, (*vecs)->iov_base, n);
+            (*vecs)->iov_base = ((char*)(*vecs)->iov_base) + n;
+            (*vecs)->iov_len -= n;
+            return true;
+        }
+        memcpy(dst, (*vecs)->iov_base, (*vecs)->iov_len);
+        dst += (*vecs)->iov_len; n -= (*vecs)->iov_len;
+        (*vecs)++; (*nvecs)--;
+    }
+    return n && !*nvecs;
+}
+
+// requires existing 'desc_idx' to use as iteration variable, and input 'buffer_idx'.
+#define __VNET_ITERATE_BUFFER(checked, body) \
+    desc_idx = buffer_idx; \
+    while (1) { \
+        if (checked && desc_idx >= queue->QueueNum) \
+            return virtionet_set_fail(vnet); \
+        uint32_t* desc = &ram[queue->QueueDesc + desc_idx * 4]; \
+        uint16_t desc_flags = desc[3]; \
+        body \
+        if (!(desc_flags & VIRTIO_DESC_F_NEXT)) break; \
+        desc_idx = desc[3] >> 16; \
+    }
+
+// input 'buffer_idx'. output 'buffer_niovs' and 'buffer_iovs'
+#define __VNET_BUFFER_TO_IOV(expect_readable) \
+    uint16_t desc_idx; \
+    /* do a first pass to validate flags and count buffers */ \
+    size_t buffer_niovs = 0; \
+    __VNET_ITERATE_BUFFER(true, \
+        if ((!!(desc_flags & VIRTIO_DESC_F_WRITE)) != (expect_readable)) \
+            return virtionet_set_fail(vnet); \
+        buffer_niovs++; \
+    ) \
+    /* convert to iov */ \
+    struct iovec buffer_iovs [buffer_niovs]; \
+    buffer_niovs = 0; \
+    __VNET_ITERATE_BUFFER(false, \
+        uint32_t desc_addr = desc[0]; uint32_t desc_len = desc[2]; \
+        buffer_iovs[buffer_niovs].iov_base = ((char*)ram) + desc_addr; \
+        buffer_iovs[buffer_niovs].iov_len = desc_len; \
+        buffer_niovs++; \
+    )
+
+#define __VNET_GENERATE_QUEUE_HANDLER(NAME_SUFFIX, VERB, QUEUE_IDX, READ) \
+    void __virtionet_try_##NAME_SUFFIX(virtionet_state_t* vnet) { \
+        uint32_t* ram = vnet->ram; \
+        virtionet_queue_t* queue = &vnet->queues[QUEUE_IDX]; \
+        if ((vnet->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) || !queue->fd_ready) \
+            return; \
+        if (!( (vnet->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready )) \
+            return virtionet_set_fail(vnet); \
+        \
+        /* check for new buffers */ \
+        uint16_t new_avail = ram[queue->QueueAvail] >> 16; \
+        if (new_avail - queue->last_avail > (uint16_t)queue->QueueNum) \
+            return (fprintf(stderr, "size check fail\n"), virtionet_set_fail(vnet)); \
+        if (queue->last_avail == new_avail) \
+            return; \
+        \
+        /* process them */ \
+        uint16_t new_used = ram[queue->QueueUsed] >> 16; \
+        while (queue->last_avail != new_avail) { \
+            uint16_t queue_idx = queue->last_avail % queue->QueueNum; \
+            uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >> (16 * (queue_idx % 2)); \
+            __VNET_BUFFER_TO_IOV(READ) \
+            struct iovec* buffer_iovs_cursor = buffer_iovs; \
+            uint8_t virtio_header [12]; \
+            if (READ) {\
+                memset(virtio_header, 0, sizeof(virtio_header)); \
+                virtio_header[10] = 1; \
+                __vnet_iovec_write(&buffer_iovs_cursor, &buffer_niovs, virtio_header, sizeof(virtio_header)); \
+            } else { \
+                __vnet_iovec_read(&buffer_iovs_cursor, &buffer_niovs, virtio_header, sizeof(virtio_header)); \
+            } \
+            \
+            ssize_t plen = VERB##v(vnet->tap_fd, buffer_iovs_cursor, buffer_niovs); \
+            if (plen < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) { \
+                queue->fd_ready = false; \
+                break; \
+            } \
+            if (plen < 0) { \
+                plen = 0; \
+                fprintf(stderr, "[VNET] could not " #VERB " packet: %s\n", strerror(errno)); \
+            } \
+            \
+            /* consume from available queue, write to used queue */ \
+            queue->last_avail++; \
+            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] = buffer_idx; \
+            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = READ ? (plen + sizeof(virtio_header)) : 0; \
+            new_used++; \
+        } \
+        vnet->ram[queue->QueueUsed] &= MASK(16); \
+        vnet->ram[queue->QueueUsed] |= ((uint32_t)new_used) << 16; \
+        \
+        /* send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */ \
+        if (!(ram[queue->QueueAvail] & 1)) \
+            vnet->InterruptStatus |= VIRTIO_INT__USED_RING; \
+    }
+
+__VNET_GENERATE_QUEUE_HANDLER(rx, read, __VNET_QUEUE_RX, true)
+__VNET_GENERATE_QUEUE_HANDLER(tx, write, __VNET_QUEUE_TX, false)
+
+void virtionet_notify_queue(virtionet_state_t* vnet, uint32_t queueIdx) {
+    switch (queueIdx) {
+        case __VNET_QUEUE_RX: return __virtionet_try_rx(vnet);
+        case __VNET_QUEUE_TX: return __virtionet_try_tx(vnet);
+    }
+}
+
+void virtionet_refresh_queue(virtionet_state_t* vnet) {
+    if (!(vnet->Status & VIRTIO_STATUS__DRIVER_OK) || (vnet->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
+        return;
+    struct pollfd pfd = { vnet->tap_fd, POLLIN | POLLOUT, 0 };
+    poll(&pfd, 1, 0);
+    if (pfd.revents & POLLIN)
+        vnet->queues[__VNET_QUEUE_RX].fd_ready = true, __virtionet_try_rx(vnet);
+    if (pfd.revents & POLLOUT)
+        vnet->queues[__VNET_QUEUE_TX].fd_ready = true, __virtionet_try_tx(vnet);
+}
+
+#define __virtionet_body(R, W) \
+    switch (addr) { \
+        R(case 0: /* MagicValue (R) */ \
+            *value = 0x74726976; return true;) \
+        R(case 1: /* Version (R) */ \
+            *value = 2; return true;) \
+        R(case 2: /* DeviceID (R) */ \
+            *value = 1; return true;) \
+        R(case 3: /* VendorID (R) */ \
+            *value = VIRTIO_VENDOR_ID; return true;) \
+        \
+        R(case 4: /* DeviceFeatures (R) */ \
+            *value = \
+                vnet->DeviceFeaturesSel == 0 ? __VNET_FEATURES_0 : \
+                vnet->DeviceFeaturesSel == 1 ? __VNET_FEATURES_1 : \
+                0; return true;) \
+        W(case 5: /* DeviceFeaturesSel (W) */ \
+            vnet->DeviceFeaturesSel = value; return true;) \
+        W(case 8: /* DriverFeatures (W) */ \
+            vnet->DriverFeaturesSel == 0 ? (vnet->DriverFeatures = value) : 0; return true;) \
+        W(case 9: /* DriverFeaturesSel (W) */ \
+            vnet->DriverFeaturesSel = value; return true;) \
+        \
+        W(case 12: /* QueueSel (W) */ \
+            if (value < (sizeof(vnet->queues) / sizeof(*(vnet->queues)))) \
+                vnet->QueueSel = value; \
+            else \
+                virtionet_set_fail(vnet); \
+            return true;) \
+        R(case 13: /* QueueNumMax (R) */ \
+            *value = __VNET_QUEUE_NUM_MAX; return true;) \
+        W(case 14: /* QueueNum (W) */ \
+            if (value > 0 && value <= __VNET_QUEUE_NUM_MAX) \
+                __VNET_QUEUE.QueueNum = value; \
+            else \
+                virtionet_set_fail(vnet); \
+            return true;) \
+        case 17: /* QueueReady (RW) */ \
+            R(*value = __VNET_QUEUE.ready ? 1 : 0;) \
+            W(__VNET_QUEUE.ready = value & 1;) \
+            W( \
+                if (value & 1) \
+                    __VNET_QUEUE.last_avail = vnet->ram[__VNET_QUEUE.QueueAvail] >> 16; \
+                if (vnet->QueueSel == __VNET_QUEUE_RX) \
+                    vnet->ram[__VNET_QUEUE.QueueAvail] |= 1; /* set VIRTQ_AVAIL_F_NO_INTERRUPT */ \
+            ) \
+            return true; \
+        W(case 32: /* QueueDescLow (W) */ \
+            __VNET_QUEUE.QueueDesc = __VNET_PREPROCESS_ADDR(value); return true;) \
+        W(case 33: /* QueueDescHigh (W) */ \
+            if (value) virtionet_set_fail(vnet); return true;) \
+        W(case 36: /* QueueAvailLow (W) */ \
+            __VNET_QUEUE.QueueAvail = __VNET_PREPROCESS_ADDR(value); return true;) \
+        W(case 37: /* QueueAvailHigh (W) */ \
+            if (value) virtionet_set_fail(vnet); return true;) \
+        W(case 40: /* QueueUsedLow (W) */ \
+            __VNET_QUEUE.QueueUsed = __VNET_PREPROCESS_ADDR(value); return true;) \
+        W(case 41: /* QueueUsedHigh (W) */ \
+            if (value) virtionet_set_fail(vnet); return true;) \
+        \
+        W(case 20: /* QueueNotify (W) */ \
+            if (value < (sizeof(vnet->queues) / sizeof(*(vnet->queues)))) \
+                virtionet_notify_queue(vnet, value); \
+            else \
+                virtionet_set_fail(vnet); \
+            return true;) \
+        R(case 24: /* InterruptStatus (R) */ \
+            *value = vnet->InterruptStatus; return true;) \
+        W(case 25: /* InterruptACK (W) */ \
+            vnet->InterruptStatus &= ~value; return true;) \
+        case 28: /* Status (RW) */ \
+            R(*value = vnet->Status;) \
+            W(virtionet_update_status(vnet, value);) \
+            return true; \
+        \
+        R(case 63: /* ConfigGeneration (R) */ \
+            *value = 0; return true;) \
+        /* FIXME: we should also expose MAC address (even if with invalid value) under 8bit accesses */ \
+        default: return false; \
+    }
+
+REG_FUNCTIONS(bool virtionet_reg, (virtionet_state_t *vnet, uint32_t addr), uint32_t, __virtionet_body)
+
+// we still need a wrapper for memory accesses
+#define __virtionet_wrap_body(R, W) \
+    switch (width) { \
+        case R(RISCV_MEM_LW) W(RISCV_MEM_SW): \
+            if (!REG_FUNC(R, W, virtionet_reg)(vnet, addr >> 2, value)) \
+                core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val); \
+            break; \
+        R(case RISCV_MEM_LBU:) \
+        R(case RISCV_MEM_LB:) \
+        R(case RISCV_MEM_LHU:) \
+        R(case RISCV_MEM_LH:) \
+        W(case RISCV_MEM_SB:) \
+        W(case RISCV_MEM_SH:) \
+            core_set_exception(core, R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN), core->exc_val); \
+            return; \
+        default: \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
+            return; \
+    }
+
+REG_FUNCTIONS(void virtionet_wrap_mem, (core_t *core, virtionet_state_t *vnet, uint32_t addr, uint8_t width), uint32_t, __virtionet_wrap_body)
+
+
 // PLIC
 // we want it to be simple so: 32 interrupts, no priority
 
@@ -260,16 +584,17 @@ REG_FUNCTIONS(void plic_wrap_mem, (core_t *core, plic_state_t *plic, uint32_t ad
 
 // memory mapping
 
-#define RAM_SIZE (512 * 1024 * 1024)
-
 #define IRQ_UART 1
 #define IRQ_UART_BIT (1 << IRQ_UART)
+#define IRQ_VNET 2
+#define IRQ_VNET_BIT (1 << IRQ_VNET)
 
 typedef struct {
     bool stopped;
     uint32_t *ram;
     plic_state_t plic;
     u8250_state_t uart;
+    virtionet_state_t vnet;
     uint32_t timer_l;
     uint32_t timer_h;
 } emu_state_t;
@@ -301,6 +626,12 @@ void emulator_update_uart_interrupts(core_t* core) {
     plic_update_interrupts(core, &data->plic);
 }
 
+void emulator_update_vnet_interrupts(core_t* core) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+    data->vnet.InterruptStatus ? (data->plic.active |= IRQ_VNET_BIT) : (data->plic.active &= ~IRQ_VNET_BIT);
+    plic_update_interrupts(core, &data->plic);
+}
+
 #define __mem_body(R, W) \
     emu_state_t *data = (emu_state_t *)core->user_data; \
     /* RAM at 0x00000000 + RAM_SIZE */ \
@@ -318,6 +649,10 @@ void emulator_update_uart_interrupts(core_t* core) {
             case 0x40: /* UART */ \
                 REG_FUNC(R, W, u8250_wrap_mem)(core, &data->uart, addr & 0xFFFFF, width, value); \
                 emulator_update_uart_interrupts(core); \
+                return; \
+            case 0x41: /* VIRTIO-NET */ \
+                REG_FUNC(R, W, virtionet_wrap_mem)(core, &data->vnet, addr & 0xFFFFF, width, value); \
+                emulator_update_vnet_interrupts(core); \
                 return; \
         } \
     } \
@@ -440,13 +775,33 @@ int main() {
     ram_cursor = ((char*)data.ram) + dtb_addr;
     read_file_into_ram(&ram_cursor, "linux_dtb");
 
-    data.uart.in_fd = 0;
-    data.uart.out_fd = 1;
-
     data.timer_h = data.timer_l = 0xFFFFFFFF;
     core.s_mode = true;
     core.x_regs[RISCV_R_A0] = 0; // hart ID (cpuid)
     core.x_regs[RISCV_R_A1] = dtb_addr;
+
+    // set up peripherals
+
+    data.uart.in_fd = 0;
+    data.uart.out_fd = 1;
+
+    data.vnet.tap_fd = open("/dev/net/tun", O_RDWR);
+    if (data.vnet.tap_fd < 0) {
+        fprintf(stderr, "failed to open TAP device: %s\n", strerror(errno));
+        return 2;
+    }
+    struct ifreq ifreq;
+    memset(&ifreq, 0, sizeof(ifreq));
+    // iproute2 sets PI, let's make it easier for folks who want to use persistent taps
+    ifreq.ifr_flags = IFF_TAP | IFF_NO_PI;
+    strncpy(ifreq.ifr_name, TAP_INTERFACE, sizeof(ifreq.ifr_name));
+    if (ioctl(data.vnet.tap_fd, TUNSETIFF, &ifreq) < 0) {
+        fprintf(stderr, "failed to allocate TAP device: %s\n", strerror(errno));
+        return 2;
+    }
+    fprintf(stderr, "allocated TAP interface: %s\n", ifreq.ifr_name);
+    assert(fcntl(data.vnet.tap_fd, F_SETFL, fcntl(data.vnet.tap_fd, F_GETFL, 0) | O_NONBLOCK) >= 0);
+    data.vnet.ram = data.ram;
 
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);
@@ -457,15 +812,20 @@ int main() {
     ioctl(cycle_count_fd, PERF_EVENT_IOC_ENABLE, 0);
     ioctl(instr_count_fd, PERF_EVENT_IOC_ENABLE, 0);
 
-    uint32_t interrupt_check_ctr = 0;
+    uint32_t peripheral_update_ctr = 0;
     while (!data.stopped) {
         //printf("pc: %#08x, sp: %#08x\n", core.pc, core.x_regs[RISCV_R_SP]);
 
-        if (interrupt_check_ctr-- == 0) {
-            interrupt_check_ctr = 64;
+        if (peripheral_update_ctr-- == 0) {
+            peripheral_update_ctr = 64;
+
             u8250_check_ready(&data.uart);
             if (data.uart.in_ready)
                 emulator_update_uart_interrupts(&core);
+
+            virtionet_refresh_queue(&data.vnet);
+            if (data.vnet.InterruptStatus)
+                emulator_update_vnet_interrupts(&core);
         }
 
         bool timer_active = core.instr_count_h > data.timer_h || (core.instr_count_h == data.timer_h && core.instr_count > data.timer_l);
