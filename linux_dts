@@ -68,5 +68,11 @@
 			reg = <0x4100000 0x100000>;
 			interrupts = <2>;
 		};
+
+		gpu0: virtio@4200000 {
+			compatible = "virtio,mmio";
+			reg = <0x4200000 0x100000>;
+			interrupts = <3>;
+		};
 	};
 };

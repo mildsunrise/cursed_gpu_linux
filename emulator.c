@@ -510,6 +510,308 @@ REG_FUNCTIONS(bool virtionet_reg, (virtionet_state_t *vnet, uint32_t addr), uint
 REG_FUNCTIONS(void virtionet_wrap_mem, (core_t *core, virtionet_state_t *vnet, uint32_t addr, uint8_t width), uint32_t, __virtionet_wrap_body)
 
 
+// VIRTIO-GPU
+
+typedef struct {
+    uint32_t QueueNum;
+    uint32_t QueueDesc;
+    uint32_t QueueAvail;
+    uint32_t QueueUsed;
+    uint16_t last_avail;
+    bool ready;
+    bool fd_ready;
+} virtiogpu_queue_t;
+
+typedef struct {
+    // feature negotiation
+    uint32_t DeviceFeaturesSel;
+    uint32_t DriverFeatures;
+    uint32_t DriverFeaturesSel;
+    // queue config
+    uint32_t QueueSel;
+    virtiogpu_queue_t queues [2];
+    // status
+    uint32_t Status;
+    uint32_t InterruptStatus;
+    // supplied by environment
+    uint32_t* ram;
+} virtiogpu_state_t;
+
+#define __VGPU_FEATURES_0 0
+#define __VGPU_FEATURES_1 1 // VIRTIO_F_VERSION_1
+#define __VGPU_QUEUE_NUM_MAX 1024
+#define __VGPU_QUEUE (vgpu->queues[vgpu->QueueSel])
+
+#define __VGPU_PREPROCESS_ADDR(addr) ((addr) < RAM_SIZE && !((addr) & 0b11) ? ((addr) >> 2) : (virtiogpu_set_fail(vnet), 0))
+
+#define __VGPU_QUEUE_RX 0
+#define __VGPU_QUEUE_TX 1
+
+void virtiogpu_set_fail(virtiogpu_state_t* vgpu) {
+    fprintf(stderr, "[VGPU] device fail\n");
+    vgpu->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
+    if (vgpu->Status & VIRTIO_STATUS__DRIVER_OK)
+        vgpu->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+}
+
+void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
+    vgpu->Status |= status;
+    if (!status) { // reset
+        //int tap_fd = vgpu->tap_fd;
+        uint32_t* ram = vgpu->ram;
+        memset(vgpu, 0, sizeof(*vgpu));
+        //vgpu->tap_fd = tap_fd;
+        vgpu->ram = ram;
+    }
+    fprintf(stderr, "[VGPU] status: %04x\n", vgpu->Status);
+}
+
+bool __vnet_iovec_write(struct iovec** vecs, size_t* nvecs, const uint8_t* src, size_t n) {
+    while (n && *nvecs) {
+        if (n < (*vecs)->iov_len) {
+            memcpy((*vecs)->iov_base, src, n);
+            (*vecs)->iov_base = ((char*)(*vecs)->iov_base) + n;
+            (*vecs)->iov_len -= n;
+            return true;
+        }
+        memcpy((*vecs)->iov_base, src, (*vecs)->iov_len);
+        src += (*vecs)->iov_len; n -= (*vecs)->iov_len;
+        (*vecs)++; (*nvecs)--;
+    }
+    return n && !*nvecs;
+}
+
+bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t n) {
+    while (n && *nvecs) {
+        if (n < (*vecs)->iov_len) {
+            memcpy(dst, (*vecs)->iov_base, n);
+            (*vecs)->iov_base = ((char*)(*vecs)->iov_base) + n;
+            (*vecs)->iov_len -= n;
+            return true;
+        }
+        memcpy(dst, (*vecs)->iov_base, (*vecs)->iov_len);
+        dst += (*vecs)->iov_len; n -= (*vecs)->iov_len;
+        (*vecs)++; (*nvecs)--;
+    }
+    return n && !*nvecs;
+}
+
+// requires existing 'desc_idx' to use as iteration variable, and input 'buffer_idx'.
+#define __VGPU_ITERATE_BUFFER(checked, body) \
+    desc_idx = buffer_idx; \
+    while (1) { \
+        if (checked && desc_idx >= queue->QueueNum) \
+            return virtiogpu_set_fail(vgpu); \
+        uint32_t* desc = &ram[queue->QueueDesc + desc_idx * 4]; \
+        uint16_t desc_flags = desc[3]; \
+        body \
+        if (!(desc_flags & VIRTIO_DESC_F_NEXT)) break; \
+        desc_idx = desc[3] >> 16; \
+    }
+
+// input 'buffer_idx'. output 'buffer_niovs' and 'buffer_iovs'
+#define __VGPU_BUFFER_TO_IOV(expect_readable) \
+    uint16_t desc_idx; \
+    /* do a first pass to validate flags and count buffers */ \
+    size_t buffer_niovs = 0; \
+    __VGPU_ITERATE_BUFFER(true, \
+        if ((!!(desc_flags & VIRTIO_DESC_F_WRITE)) != (expect_readable)) \
+            return virtiogpu_set_fail(vgpu); \
+        buffer_niovs++; \
+    ) \
+    /* convert to iov */ \
+    struct iovec buffer_iovs [buffer_niovs]; \
+    buffer_niovs = 0; \
+    __VGPU_ITERATE_BUFFER(false, \
+        uint32_t desc_addr = desc[0]; uint32_t desc_len = desc[2]; \
+        buffer_iovs[buffer_niovs].iov_base = ((char*)ram) + desc_addr; \
+        buffer_iovs[buffer_niovs].iov_len = desc_len; \
+        buffer_niovs++; \
+    )
+
+#define __VGPU_GENERATE_QUEUE_HANDLER(NAME_SUFFIX, VERB, QUEUE_IDX, READ) \
+    void __virtiogpu_try_##NAME_SUFFIX(virtiogpu_state_t* vgpu) { \
+        uint32_t* ram = vgpu->ram; \
+        virtiogpu_queue_t* queue = &vgpu->queues[QUEUE_IDX]; \
+        if ((vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) || !queue->fd_ready) \
+            return; \
+        if (!( (vgpu->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready )) \
+            return virtiogpu_set_fail(vgpu); \
+        \
+        /* check for new buffers */ \
+        uint16_t new_avail = ram[queue->QueueAvail] >> 16; \
+        if (new_avail - queue->last_avail > (uint16_t)queue->QueueNum) \
+            return (fprintf(stderr, "size check fail\n"), virtiogpu_set_fail(vgpu)); \
+        if (queue->last_avail == new_avail) \
+            return; \
+        \
+        /* process them */ \
+        uint16_t new_used = ram[queue->QueueUsed] >> 16; \
+        while (queue->last_avail != new_avail) { \
+            uint16_t queue_idx = queue->last_avail % queue->QueueNum; \
+            uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >> (16 * (queue_idx % 2)); \
+            __VGPU_BUFFER_TO_IOV(READ) \
+            struct iovec* buffer_iovs_cursor = buffer_iovs; \
+            uint8_t virtio_header [12]; \
+            if (READ) {\
+                memset(virtio_header, 0, sizeof(virtio_header)); \
+                virtio_header[10] = 1; \
+                __vnet_iovec_write(&buffer_iovs_cursor, &buffer_niovs, virtio_header, sizeof(virtio_header)); \
+            } else { \
+                __vnet_iovec_read(&buffer_iovs_cursor, &buffer_niovs, virtio_header, sizeof(virtio_header)); \
+            } \
+            \
+            ssize_t plen = VERB##v(vgpu->tap_fd, buffer_iovs_cursor, buffer_niovs); \
+            if (plen < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) { \
+                queue->fd_ready = false; \
+                break; \
+            } \
+            if (plen < 0) { \
+                plen = 0; \
+                fprintf(stderr, "[VGPU] could not " #VERB " packet: %s\n", strerror(errno)); \
+            } \
+            \
+            /* consume from available queue, write to used queue */ \
+            queue->last_avail++; \
+            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] = buffer_idx; \
+            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = READ ? (plen + sizeof(virtio_header)) : 0; \
+            new_used++; \
+        } \
+        vgpu->ram[queue->QueueUsed] &= MASK(16); \
+        vgpu->ram[queue->QueueUsed] |= ((uint32_t)new_used) << 16; \
+        \
+        /* send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */ \
+        if (!(ram[queue->QueueAvail] & 1)) \
+            vgpu->InterruptStatus |= VIRTIO_INT__USED_RING; \
+    }
+
+__VGPU_GENERATE_QUEUE_HANDLER(rx, read, __VGPU_QUEUE_RX, true)
+__VGPU_GENERATE_QUEUE_HANDLER(tx, write, __VGPU_QUEUE_TX, false)
+
+void virtiogpu_notify_queue(virtiogpu_state_t* vgpu, uint32_t queueIdx) {
+    switch (queueIdx) {
+        case __VGPU_QUEUE_RX: return __virtiogpu_try_rx(vgpu);
+        case __VGPU_QUEUE_TX: return __virtiogpu_try_tx(vgpu);
+    }
+}
+
+void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
+    if (!(vgpu->Status & VIRTIO_STATUS__DRIVER_OK) || (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
+        return;
+    struct pollfd pfd = { vgpu->tap_fd, POLLIN | POLLOUT, 0 };
+    poll(&pfd, 1, 0);
+    if (pfd.revents & POLLIN)
+        vgpu->queues[__VGPU_QUEUE_RX].fd_ready = true, __virtiogpu_try_rx(vgpu);
+    if (pfd.revents & POLLOUT)
+        vgpu->queues[__VGPU_QUEUE_TX].fd_ready = true, __virtiogpu_try_tx(vgpu);
+}
+
+#define __virtiogpu_body(R, W) \
+    switch (addr) { \
+        R(case 0: /* MagicValue (R) */ \
+            *value = 0x74726976; return true;) \
+        R(case 1: /* Version (R) */ \
+            *value = 2; return true;) \
+        R(case 2: /* DeviceID (R) */ \
+            *value = 1; return true;) \
+        R(case 3: /* VendorID (R) */ \
+            *value = VIRTIO_VENDOR_ID; return true;) \
+        \
+        R(case 4: /* DeviceFeatures (R) */ \
+            *value = \
+                vgpu->DeviceFeaturesSel == 0 ? __VGPU_FEATURES_0 : \
+                vgpu->DeviceFeaturesSel == 1 ? __VGPU_FEATURES_1 : \
+                0; return true;) \
+        W(case 5: /* DeviceFeaturesSel (W) */ \
+            vgpu->DeviceFeaturesSel = value; return true;) \
+        W(case 8: /* DriverFeatures (W) */ \
+            vgpu->DriverFeaturesSel == 0 ? (vgpu->DriverFeatures = value) : 0; return true;) \
+        W(case 9: /* DriverFeaturesSel (W) */ \
+            vgpu->DriverFeaturesSel = value; return true;) \
+        \
+        W(case 12: /* QueueSel (W) */ \
+            if (value < (sizeof(vgpu->queues) / sizeof(*(vgpu->queues)))) \
+                vgpu->QueueSel = value; \
+            else \
+                virtiogpu_set_fail(vgpu); \
+            return true;) \
+        R(case 13: /* QueueNumMax (R) */ \
+            *value = __VGPU_QUEUE_NUM_MAX; return true;) \
+        W(case 14: /* QueueNum (W) */ \
+            if (value > 0 && value <= __VGPU_QUEUE_NUM_MAX) \
+                __VGPU_QUEUE.QueueNum = value; \
+            else \
+                virtiogpu_set_fail(vgpu); \
+            return true;) \
+        case 17: /* QueueReady (RW) */ \
+            R(*value = __VGPU_QUEUE.ready ? 1 : 0;) \
+            W(__VGPU_QUEUE.ready = value & 1;) \
+            W( \
+                if (value & 1) \
+                    __VGPU_QUEUE.last_avail = vgpu->ram[__VGPU_QUEUE.QueueAvail] >> 16; \
+                if (vgpu->QueueSel == __VGPU_QUEUE_RX) \
+                    vgpu->ram[__VGPU_QUEUE.QueueAvail] |= 1; /* set VIRTQ_AVAIL_F_NO_INTERRUPT */ \
+            ) \
+            return true; \
+        W(case 32: /* QueueDescLow (W) */ \
+            __VGPU_QUEUE.QueueDesc = __VGPU_PREPROCESS_ADDR(value); return true;) \
+        W(case 33: /* QueueDescHigh (W) */ \
+            if (value) virtiogpu_set_fail(vgpu); return true;) \
+        W(case 36: /* QueueAvailLow (W) */ \
+            __VGPU_QUEUE.QueueAvail = __VGPU_PREPROCESS_ADDR(value); return true;) \
+        W(case 37: /* QueueAvailHigh (W) */ \
+            if (value) virtiogpu_set_fail(vgpu); return true;) \
+        W(case 40: /* QueueUsedLow (W) */ \
+            __VGPU_QUEUE.QueueUsed = __VGPU_PREPROCESS_ADDR(value); return true;) \
+        W(case 41: /* QueueUsedHigh (W) */ \
+            if (value) virtiogpu_set_fail(vgpu); return true;) \
+        \
+        W(case 20: /* QueueNotify (W) */ \
+            if (value < (sizeof(vgpu->queues) / sizeof(*(vgpu->queues)))) \
+                virtiogpu_notify_queue(vgpu, value); \
+            else \
+                virtiogpu_set_fail(vgpu); \
+            return true;) \
+        R(case 24: /* InterruptStatus (R) */ \
+            *value = vgpu->InterruptStatus; return true;) \
+        W(case 25: /* InterruptACK (W) */ \
+            vgpu->InterruptStatus &= ~value; return true;) \
+        case 28: /* Status (RW) */ \
+            R(*value = vgpu->Status;) \
+            W(virtiogpu_update_status(vgpu, value);) \
+            return true; \
+        \
+        R(case 63: /* ConfigGeneration (R) */ \
+            *value = 0; return true;) \
+        /* FIXME: we should also expose MAC address (even if with invalid value) under 8bit accesses */ \
+        default: return false; \
+    }
+
+REG_FUNCTIONS(bool virtiogpu_reg, (virtiogpu_state_t *vgpu, uint32_t addr), uint32_t, __virtiogpu_body)
+
+// we still need a wrapper for memory accesses
+#define __virtiogpu_wrap_body(R, W) \
+    switch (width) { \
+        case R(RISCV_MEM_LW) W(RISCV_MEM_SW): \
+            if (!REG_FUNC(R, W, virtiogpu_reg)(vgpu, addr >> 2, value)) \
+                core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val); \
+            break; \
+        R(case RISCV_MEM_LBU:) \
+        R(case RISCV_MEM_LB:) \
+        R(case RISCV_MEM_LHU:) \
+        R(case RISCV_MEM_LH:) \
+        W(case RISCV_MEM_SB:) \
+        W(case RISCV_MEM_SH:) \
+            core_set_exception(core, R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN), core->exc_val); \
+            return; \
+        default: \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
+            return; \
+    }
+
+REG_FUNCTIONS(void virtiogpu_wrap_mem, (core_t *core, virtiogpu_state_t *vgpu, uint32_t addr, uint8_t width), uint32_t, __virtiogpu_wrap_body)
+
+
 // PLIC
 // we want it to be simple so: 32 interrupts, no priority
 
@@ -590,6 +892,8 @@ REG_FUNCTIONS(void plic_wrap_mem, (core_t *core, plic_state_t *plic, uint32_t ad
 #define IRQ_UART_BIT (1 << IRQ_UART)
 #define IRQ_VNET 2
 #define IRQ_VNET_BIT (1 << IRQ_VNET)
+#define IRQ_VGPU 3
+#define IRQ_VGPU_BIT (1 << IRQ_VGPU)
 
 typedef struct {
     bool stopped;
@@ -597,6 +901,7 @@ typedef struct {
     plic_state_t plic;
     u8250_state_t uart;
     virtionet_state_t vnet;
+    virtiogpu_state_t gpu;
     uint32_t timer_l;
     uint32_t timer_h;
 } emu_state_t;
@@ -634,6 +939,12 @@ void emulator_update_vnet_interrupts(core_t* core) {
     plic_update_interrupts(core, &data->plic);
 }
 
+void emulator_update_vgpu_interrupts(core_t* core) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+    data->gpu.InterruptStatus ? (data->plic.active |= IRQ_VGPU_BIT) : (data->plic.active &= ~IRQ_VGPU_BIT);
+    plic_update_interrupts(core, &data->plic);
+}
+
 #define __mem_body(R, W) \
     emu_state_t *data = (emu_state_t *)core->user_data; \
     /* RAM at 0x00000000 + RAM_SIZE */ \
@@ -655,6 +966,10 @@ void emulator_update_vnet_interrupts(core_t* core) {
             case 0x41: /* VIRTIO-NET */ \
                 REG_FUNC(R, W, virtionet_wrap_mem)(core, &data->vnet, addr & 0xFFFFF, width, value); \
                 emulator_update_vnet_interrupts(core); \
+                return; \
+            case 0x42: /* VIRTIO-GPU */ \
+                REG_FUNC(R, W, virtiogpu_wrap_mem)(core, &data->gpu, addr & 0xFFFFF, width, value); \
+                emulator_update_vgpu_interrupts(core); \
                 return; \
         } \
     } \
