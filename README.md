@@ -19,7 +19,7 @@ The full emulator exposes a few peripherals:
 
  - 512MiB main memory
  - Standard RISC-V PLIC (32 interrupts, no priority support)
- - Standard SBI, with the timer extension
+ - Standard SBI, with timer & reset extensions
  - 8250/16550 UART for console, mapped as stdin/stdout
  - virtio-net v2 interface, mapped as TAP interface (no extra features)
 

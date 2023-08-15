@@ -30,7 +30,7 @@
 // should be defined under "memory mapping", but defined here because of dependencies
 #define RAM_SIZE (512 * 1024 * 1024)
 
-#define TAP_INTERFACE "tap%d"
+#define TAP_INTERFACE "tap0"
 
 
 // main memory handlers (address must be relative, assumes it's within bounds)
@@ -246,6 +246,7 @@ typedef struct {
 #define __VNET_QUEUE_TX 1
 
 void virtionet_set_fail(virtionet_state_t* vnet) {
+    fprintf(stderr, "[VNET] device fail\n");
     vnet->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
     if (vnet->Status & VIRTIO_STATUS__DRIVER_OK)
         vnet->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
@@ -260,6 +261,7 @@ void virtionet_update_status(virtionet_state_t* vnet, uint32_t status) {
         vnet->tap_fd = tap_fd;
         vnet->ram = ram;
     }
+    fprintf(stderr, "[VNET] status: %04x\n", vnet->Status);
 }
 
 bool __vnet_iovec_write(struct iovec** vecs, size_t* nvecs, const uint8_t* src, size_t n) {

@@ -17,7 +17,7 @@
 	cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
-		timebase-frequency = <65000000>;
+		timebase-frequency = <45000000>;
 		cpu0: cpu@0 {
 			device_type = "cpu";
 			compatible = "riscv";
