@@ -14,6 +14,7 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <sys/uio.h>
+#include <virglrenderer.h>
 #include "measure.c"
 
 #define MASK(n) (~((~0U << (n))))
@@ -542,7 +543,7 @@ typedef struct {
 #define __VGPU_QUEUE_NUM_MAX 1024
 #define __VGPU_QUEUE (vgpu->queues[vgpu->QueueSel])
 
-#define __VGPU_PREPROCESS_ADDR(addr) ((addr) < RAM_SIZE && !((addr) & 0b11) ? ((addr) >> 2) : (virtiogpu_set_fail(vnet), 0))
+#define __VGPU_PREPROCESS_ADDR(addr) ((addr) < RAM_SIZE && !((addr) & 0b11) ? ((addr) >> 2) : (virtiogpu_set_fail(vgpu), 0))
 
 #define __VGPU_QUEUE_RX 0
 #define __VGPU_QUEUE_TX 1
@@ -1119,6 +1120,16 @@ int main() {
     fprintf(stderr, "allocated TAP interface: %s\n", ifreq.ifr_name);
     assert(fcntl(data.vnet.tap_fd, F_SETFL, fcntl(data.vnet.tap_fd, F_GETFL, 0) | O_NONBLOCK) >= 0);
     data.vnet.ram = data.ram;
+
+    int virgl_flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS /* | VIRGL_RENDERER_USE_EXTERNAL_BLOB */;
+    struct virgl_renderer_callbacks virgl_cbs;
+    memset(&virgl_cbs, 0, sizeof(virgl_cbs));
+    virgl_cbs.version = VIRGL_RENDERER_CALLBACKS_VERSION;
+    // TODO: write_fence cb?
+    if (virgl_renderer_init(&data, virgl_flags, &virgl_cbs)) {
+        fprintf(stderr, "failed to initialize virgl renderer\n");
+        return 2;
+    }
 
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);

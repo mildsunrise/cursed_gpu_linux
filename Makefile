@@ -5,7 +5,7 @@ all: linux_dtb emulator
 core_test: core.c core.h test.c measure.c reg_macros.h riscv_constants.h
 	gcc -flto -O3 -g -Wall -Wextra core.c test.c -o $@
 emulator: core.c core.h emulator.c measure.c reg_macros.h riscv_constants.h
-	gcc -flto -O3 -g -Wall -Wextra core.c emulator.c -o $@
+	gcc -flto -O3 -g -Wall -Wextra -Ivirglrenderer/src core.c emulator.c -Lvirglrenderer/build/src -lvirglrenderer -o $@
 
 # kernel
 
