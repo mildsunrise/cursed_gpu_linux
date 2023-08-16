@@ -2,6 +2,7 @@
 
 #include "core.h"
 #include "reg_macros.h"
+#include "virtio_constants.h"
 #include <stdio.h>
 #include <sys/mman.h>
 #include <assert.h>
@@ -222,29 +223,12 @@ typedef struct {
     uint32_t* ram;
 } virtionet_state_t;
 
-#define VIRTIO_STATUS__ACKNOWLEDGE           1
-#define VIRTIO_STATUS__DRIVER                2
-#define VIRTIO_STATUS__FAILED              128
-#define VIRTIO_STATUS__FEATURES_OK           8
-#define VIRTIO_STATUS__DRIVER_OK             4
-#define VIRTIO_STATUS__DEVICE_NEEDS_RESET   64
-
-#define VIRTIO_INT__USED_RING   1
-#define VIRTIO_INT__CONF_CHANGE 2
-
-#define VIRTIO_DESC_F_NEXT      1
-#define VIRTIO_DESC_F_WRITE     2
-#define VIRTIO_DESC_F_INDIRECT  4
-
 #define __VNET_FEATURES_0 0
 #define __VNET_FEATURES_1 1 // VIRTIO_F_VERSION_1
 #define __VNET_QUEUE_NUM_MAX 1024
 #define __VNET_QUEUE (vnet->queues[vnet->QueueSel])
 
 #define __VNET_PREPROCESS_ADDR(addr) ((addr) < RAM_SIZE && !((addr) & 0b11) ? ((addr) >> 2) : (virtionet_set_fail(vnet), 0))
-
-#define __VNET_QUEUE_RX 0
-#define __VNET_QUEUE_TX 1
 
 void virtionet_set_fail(virtionet_state_t* vnet) {
     fprintf(stderr, "[VNET] device fail\n");
@@ -304,7 +288,7 @@ bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t 
         uint32_t* desc = &ram[queue->QueueDesc + desc_idx * 4]; \
         uint16_t desc_flags = desc[3]; \
         body \
-        if (!(desc_flags & VIRTIO_DESC_F_NEXT)) break; \
+        if (!(desc_flags & VIRTQ_DESC_F_NEXT)) break; \
         desc_idx = desc[3] >> 16; \
     }
 
@@ -314,7 +298,7 @@ bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t 
     /* do a first pass to validate flags and count buffers */ \
     size_t buffer_niovs = 0; \
     __VNET_ITERATE_BUFFER(true, \
-        if ((!!(desc_flags & VIRTIO_DESC_F_WRITE)) != (expect_readable)) \
+        if ((!!(desc_flags & VIRTQ_DESC_F_WRITE)) != (expect_readable)) \
             return virtionet_set_fail(vnet); \
         buffer_niovs++; \
     ) \
@@ -408,9 +392,9 @@ void virtionet_refresh_queue(virtionet_state_t* vnet) {
 #define __virtionet_body(R, W) \
     switch (addr) { \
         R(case 0: /* MagicValue (R) */ \
-            *value = 0x74726976; return true;) \
+            *value = __VIRTIO_MAGIC; return true;) \
         R(case 1: /* Version (R) */ \
-            *value = 2; return true;) \
+            *value = __VIRTIO_ID_NET; return true;) \
         R(case 2: /* DeviceID (R) */ \
             *value = 1; return true;) \
         R(case 3: /* VendorID (R) */ \
@@ -534,19 +518,18 @@ typedef struct {
     // status
     uint32_t Status;
     uint32_t InterruptStatus;
+    // device specific config
+    uint32_t pending_events;
     // supplied by environment
     uint32_t* ram;
 } virtiogpu_state_t;
 
-#define __VGPU_FEATURES_0 0
+#define __VGPU_FEATURES_0 ((1 << VIRTIO_GPU_F_VIRGL) /*| (1 << VIRTIO_GPU_F_RESOURCE_SHARED)*/)
 #define __VGPU_FEATURES_1 1 // VIRTIO_F_VERSION_1
 #define __VGPU_QUEUE_NUM_MAX 1024
 #define __VGPU_QUEUE (vgpu->queues[vgpu->QueueSel])
 
 #define __VGPU_PREPROCESS_ADDR(addr) ((addr) < RAM_SIZE && !((addr) & 0b11) ? ((addr) >> 2) : (virtiogpu_set_fail(vgpu), 0))
-
-#define __VGPU_QUEUE_RX 0
-#define __VGPU_QUEUE_TX 1
 
 void virtiogpu_set_fail(virtiogpu_state_t* vgpu) {
     fprintf(stderr, "[VGPU] device fail\n");
@@ -567,36 +550,6 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
     fprintf(stderr, "[VGPU] status: %04x\n", vgpu->Status);
 }
 
-bool __vnet_iovec_write(struct iovec** vecs, size_t* nvecs, const uint8_t* src, size_t n) {
-    while (n && *nvecs) {
-        if (n < (*vecs)->iov_len) {
-            memcpy((*vecs)->iov_base, src, n);
-            (*vecs)->iov_base = ((char*)(*vecs)->iov_base) + n;
-            (*vecs)->iov_len -= n;
-            return true;
-        }
-        memcpy((*vecs)->iov_base, src, (*vecs)->iov_len);
-        src += (*vecs)->iov_len; n -= (*vecs)->iov_len;
-        (*vecs)++; (*nvecs)--;
-    }
-    return n && !*nvecs;
-}
-
-bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t n) {
-    while (n && *nvecs) {
-        if (n < (*vecs)->iov_len) {
-            memcpy(dst, (*vecs)->iov_base, n);
-            (*vecs)->iov_base = ((char*)(*vecs)->iov_base) + n;
-            (*vecs)->iov_len -= n;
-            return true;
-        }
-        memcpy(dst, (*vecs)->iov_base, (*vecs)->iov_len);
-        dst += (*vecs)->iov_len; n -= (*vecs)->iov_len;
-        (*vecs)++; (*nvecs)--;
-    }
-    return n && !*nvecs;
-}
-
 // requires existing 'desc_idx' to use as iteration variable, and input 'buffer_idx'.
 #define __VGPU_ITERATE_BUFFER(checked, body) \
     desc_idx = buffer_idx; \
@@ -606,31 +559,11 @@ bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t 
         uint32_t* desc = &ram[queue->QueueDesc + desc_idx * 4]; \
         uint16_t desc_flags = desc[3]; \
         body \
-        if (!(desc_flags & VIRTIO_DESC_F_NEXT)) break; \
+        if (!(desc_flags & VIRTQ_DESC_F_NEXT)) break; \
         desc_idx = desc[3] >> 16; \
     }
 
-// input 'buffer_idx'. output 'buffer_niovs' and 'buffer_iovs'
-#define __VGPU_BUFFER_TO_IOV(expect_readable) \
-    uint16_t desc_idx; \
-    /* do a first pass to validate flags and count buffers */ \
-    size_t buffer_niovs = 0; \
-    __VGPU_ITERATE_BUFFER(true, \
-        if ((!!(desc_flags & VIRTIO_DESC_F_WRITE)) != (expect_readable)) \
-            return virtiogpu_set_fail(vgpu); \
-        buffer_niovs++; \
-    ) \
-    /* convert to iov */ \
-    struct iovec buffer_iovs [buffer_niovs]; \
-    buffer_niovs = 0; \
-    __VGPU_ITERATE_BUFFER(false, \
-        uint32_t desc_addr = desc[0]; uint32_t desc_len = desc[2]; \
-        buffer_iovs[buffer_niovs].iov_base = ((char*)ram) + desc_addr; \
-        buffer_iovs[buffer_niovs].iov_len = desc_len; \
-        buffer_niovs++; \
-    )
-
-#define __VGPU_GENERATE_QUEUE_HANDLER(NAME_SUFFIX, VERB, QUEUE_IDX, READ) \
+#define __VGPU_GENERATE_QUEUE_HANDLER(NAME_SUFFIX, QUEUE_IDX) \
     void __virtiogpu_try_##NAME_SUFFIX(virtiogpu_state_t* vgpu) { \
         uint32_t* ram = vgpu->ram; \
         virtiogpu_queue_t* queue = &vgpu->queues[QUEUE_IDX]; \
@@ -651,31 +584,20 @@ bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t 
         while (queue->last_avail != new_avail) { \
             uint16_t queue_idx = queue->last_avail % queue->QueueNum; \
             uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >> (16 * (queue_idx % 2)); \
-            __VGPU_BUFFER_TO_IOV(READ) \
-            struct iovec* buffer_iovs_cursor = buffer_iovs; \
-            uint8_t virtio_header [12]; \
-            if (READ) {\
-                memset(virtio_header, 0, sizeof(virtio_header)); \
-                virtio_header[10] = 1; \
-                __vnet_iovec_write(&buffer_iovs_cursor, &buffer_niovs, virtio_header, sizeof(virtio_header)); \
-            } else { \
-                __vnet_iovec_read(&buffer_iovs_cursor, &buffer_niovs, virtio_header, sizeof(virtio_header)); \
-            } \
-            \
-            ssize_t plen = VERB##v(vgpu->tap_fd, buffer_iovs_cursor, buffer_niovs); \
-            if (plen < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) { \
-                queue->fd_ready = false; \
-                break; \
-            } \
-            if (plen < 0) { \
-                plen = 0; \
-                fprintf(stderr, "[VGPU] could not " #VERB " packet: %s\n", strerror(errno)); \
-            } \
-            \
+            printf("[BUFFER]\n"); \
+            uint16_t desc_idx; __VGPU_ITERATE_BUFFER(true, \
+                printf("desc %#x: flags %u, len %u, %s\n", desc_idx, desc_flags & ~(VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT), desc[2], (desc_flags & VIRTQ_DESC_F_WRITE) ? "WRITE" : "READ"); \
+                if (!(desc_flags & VIRTQ_DESC_F_WRITE)) { \
+                    if (desc[2] < sizeof(struct virtio_gpu_ctrl_hdr)) \
+                        return virtiogpu_set_fail(vgpu); \
+                    struct virtio_gpu_ctrl_hdr *hdr = (struct virtio_gpu_ctrl_hdr *) &vgpu->ram[desc[0] >> 2]; \
+                    printf("  type: %32s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", virtio_gpu_ctrl_type_to_string(hdr->type), hdr->flags, hdr->fence_id, hdr->ctx_id, desc[2] - sizeof(struct virtio_gpu_ctrl_hdr)); \
+                } \
+            ) \
             /* consume from available queue, write to used queue */ \
             queue->last_avail++; \
             ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] = buffer_idx; \
-            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = READ ? (plen + sizeof(virtio_header)) : 0; \
+            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = 0 /*FIXME*/; \
             new_used++; \
         } \
         vgpu->ram[queue->QueueUsed] &= MASK(16); \
@@ -686,35 +608,30 @@ bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t 
             vgpu->InterruptStatus |= VIRTIO_INT__USED_RING; \
     }
 
-__VGPU_GENERATE_QUEUE_HANDLER(rx, read, __VGPU_QUEUE_RX, true)
-__VGPU_GENERATE_QUEUE_HANDLER(tx, write, __VGPU_QUEUE_TX, false)
+__VGPU_GENERATE_QUEUE_HANDLER(control, __VGPU_QUEUE_CONTROL)
+__VGPU_GENERATE_QUEUE_HANDLER(cursor, __VGPU_QUEUE_CURSOR)
 
 void virtiogpu_notify_queue(virtiogpu_state_t* vgpu, uint32_t queueIdx) {
     switch (queueIdx) {
-        case __VGPU_QUEUE_RX: return __virtiogpu_try_rx(vgpu);
-        case __VGPU_QUEUE_TX: return __virtiogpu_try_tx(vgpu);
+        case __VGPU_QUEUE_CONTROL: return __virtiogpu_try_control(vgpu);
+        case __VGPU_QUEUE_CURSOR: return __virtiogpu_try_cursor(vgpu);
     }
 }
 
 void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
     if (!(vgpu->Status & VIRTIO_STATUS__DRIVER_OK) || (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
         return;
-    struct pollfd pfd = { vgpu->tap_fd, POLLIN | POLLOUT, 0 };
-    poll(&pfd, 1, 0);
-    if (pfd.revents & POLLIN)
-        vgpu->queues[__VGPU_QUEUE_RX].fd_ready = true, __virtiogpu_try_rx(vgpu);
-    if (pfd.revents & POLLOUT)
-        vgpu->queues[__VGPU_QUEUE_TX].fd_ready = true, __virtiogpu_try_tx(vgpu);
+    // FIXME
 }
 
 #define __virtiogpu_body(R, W) \
     switch (addr) { \
         R(case 0: /* MagicValue (R) */ \
-            *value = 0x74726976; return true;) \
+            *value = __VIRTIO_MAGIC; return true;) \
         R(case 1: /* Version (R) */ \
             *value = 2; return true;) \
         R(case 2: /* DeviceID (R) */ \
-            *value = 1; return true;) \
+            *value = __VIRTIO_ID_GPU; return true;) \
         R(case 3: /* VendorID (R) */ \
             *value = VIRTIO_VENDOR_ID; return true;) \
         \
@@ -750,8 +667,7 @@ void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
             W( \
                 if (value & 1) \
                     __VGPU_QUEUE.last_avail = vgpu->ram[__VGPU_QUEUE.QueueAvail] >> 16; \
-                if (vgpu->QueueSel == __VGPU_QUEUE_RX) \
-                    vgpu->ram[__VGPU_QUEUE.QueueAvail] |= 1; /* set VIRTQ_AVAIL_F_NO_INTERRUPT */ \
+                vgpu->ram[__VGPU_QUEUE.QueueAvail] |= 1; /* set VIRTQ_AVAIL_F_NO_INTERRUPT */ \
             ) \
             return true; \
         W(case 32: /* QueueDescLow (W) */ \
@@ -784,7 +700,15 @@ void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
         \
         R(case 63: /* ConfigGeneration (R) */ \
             *value = 0; return true;) \
-        /* FIXME: we should also expose MAC address (even if with invalid value) under 8bit accesses */ \
+        /* device-specific configuration space */ \
+        R(case 64: /* events_read */ \
+            *value = vgpu->pending_events; return true;) \
+        W(case 65: /* events_clear */ \
+            vgpu->pending_events &= ~value; return true;) \
+        R(case 66: /* num_scanouts */ \
+            *value = 1; return true;) \
+        R(case 67: /* reserved */ \
+            *value = 0; return true;) \
         default: return false; \
     }
 
@@ -1154,6 +1078,10 @@ int main() {
             virtionet_refresh_queue(&data.vnet);
             if (data.vnet.InterruptStatus)
                 emulator_update_vnet_interrupts(&core);
+
+            virtiogpu_refresh_queue(&data.gpu);
+            if (data.gpu.InterruptStatus)
+                emulator_update_vgpu_interrupts(&core);
         }
 
         bool timer_active = core.instr_count_h > data.timer_h || (core.instr_count_h == data.timer_h && core.instr_count > data.timer_l);
