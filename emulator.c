@@ -246,7 +246,7 @@ void virtionet_update_status(virtionet_state_t* vnet, uint32_t status) {
         vnet->tap_fd = tap_fd;
         vnet->ram = ram;
     }
-    fprintf(stderr, "[VNET] status: %04x\n", vnet->Status);
+    fprintf(stderr, "[VNET] status: %s\n", virtio_status_to_string(vnet->Status));
 }
 
 bool __vnet_iovec_write(struct iovec** vecs, size_t* nvecs, const uint8_t* src, size_t n) {
@@ -547,7 +547,7 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
         //vgpu->tap_fd = tap_fd;
         vgpu->ram = ram;
     }
-    fprintf(stderr, "[VGPU] status: %04x\n", vgpu->Status);
+    fprintf(stderr, "[VGPU] status: %s\n", virtio_status_to_string(vgpu->Status));
 }
 
 // requires existing 'desc_idx' to use as iteration variable, and input 'buffer_idx'.

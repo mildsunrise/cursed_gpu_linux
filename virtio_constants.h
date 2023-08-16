@@ -128,6 +128,39 @@ static inline uint16_t *virtq_avail_event(struct virtq *vq) {
 #define VIRTIO_STATUS__DRIVER_OK             4
 #define VIRTIO_STATUS__DEVICE_NEEDS_RESET   64
 
+#include <string.h>
+#include <stdio.h>
+
+static inline const char *virtio_status_to_string(uint32_t type) {
+    static struct { uint32_t value; const char *label; } NAMES [] = {
+        { VIRTIO_STATUS__ACKNOWLEDGE, "ACKNOWLEDGE" },
+        { VIRTIO_STATUS__DRIVER, "DRIVER" },
+        { VIRTIO_STATUS__FAILED, "FAILED" },
+        { VIRTIO_STATUS__FEATURES_OK, "FEATURES_OK" },
+        { VIRTIO_STATUS__DRIVER_OK, "DRIVER_OK" },
+        { VIRTIO_STATUS__DEVICE_NEEDS_RESET, "DEVICE_NEEDS_RESET" },
+    };
+    static char result_buf [128];
+    char *result = result_buf;
+    *result = 0;
+    for (size_t i = 0; i < sizeof(NAMES) / sizeof(*NAMES); i++) {
+        if (!(type & NAMES[i].value))
+            continue;
+        if (result != result_buf)
+            result = stpcpy(result, " | ");
+        result = stpcpy(result, NAMES[i].label);
+        type &= ~NAMES[i].value;
+    }
+    if (type) {
+        if (result != result_buf)
+            result = stpcpy(result, " | ");
+        sprintf(result, "%#x", type);
+    }
+    if (result == result_buf)
+        return "none";
+    return result_buf;
+}
+
 #define VIRTIO_INT__USED_RING   1
 #define VIRTIO_INT__CONF_CHANGE 2
 
@@ -200,7 +233,7 @@ enum virtio_gpu_ctrl_type {
 
 #include <stdio.h>
 
-const char *virtio_gpu_ctrl_type_to_string(uint32_t type) {
+static inline const char *virtio_gpu_ctrl_type_to_string(uint32_t type) {
     static struct { uint32_t value; const char *label; } NAMES [] = {
         { VIRTIO_GPU_CMD_GET_DISPLAY_INFO, "CMD_GET_DISPLAY_INFO" },
         { VIRTIO_GPU_CMD_RESOURCE_CREATE_2D, "CMD_RESOURCE_CREATE_2D" },
