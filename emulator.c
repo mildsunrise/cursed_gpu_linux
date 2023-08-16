@@ -707,7 +707,7 @@ void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
             vgpu->pending_events &= ~value; return true;) \
         R(case 66: /* num_scanouts */ \
             *value = 1; return true;) \
-        R(case 67: /* reserved */ \
+        R(case 67: /* num_capsets */ \
             *value = 0; return true;) \
         default: return false; \
     }
