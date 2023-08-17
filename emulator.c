@@ -433,7 +433,7 @@ void virtionet_refresh_queue(virtionet_state_t* vnet) {
                 if (value & 1) \
                     __VNET_QUEUE.last_avail = vnet->ram[__VNET_QUEUE.QueueAvail] >> 16; \
                 if (vnet->QueueSel == __VNET_QUEUE_RX) \
-                    vnet->ram[__VNET_QUEUE.QueueAvail] |= 1; /* set VIRTQ_AVAIL_F_NO_INTERRUPT */ \
+                    vnet->ram[__VNET_QUEUE.QueueUsed] |= 1; /* set VIRTQ_USED_F_NO_NOTIFY */ \
             ) \
             return true; \
         W(case 32: /* QueueDescLow (W) */ \
@@ -497,6 +497,16 @@ REG_FUNCTIONS(void virtionet_wrap_mem, (core_t *core, virtionet_state_t *vnet, u
 
 // VIRTIO-GPU
 
+// the protocols we offer
+static const uint32_t __VGPU_CAPSETS [] = {
+   VIRTIO_GPU_CAPSET_VIRGL,
+   VIRTIO_GPU_CAPSET_VIRGL2,
+   // VIRTIO_GPU_CAPSET_VENUS,  // even though virglrenderer implements this, we're going to start slow
+};
+
+#define __VGPU_NUM_SCANOUTS 1
+#define __VGPU_NUM_CAPSETS (sizeof(__VGPU_CAPSETS) / sizeof(*__VGPU_CAPSETS))
+
 typedef struct {
     uint32_t QueueNum;
     uint32_t QueueDesc;
@@ -524,7 +534,7 @@ typedef struct {
     uint32_t* ram;
 } virtiogpu_state_t;
 
-#define __VGPU_FEATURES_0 ((1 << VIRTIO_GPU_F_VIRGL) /*| (1 << VIRTIO_GPU_F_RESOURCE_SHARED)*/)
+#define __VGPU_FEATURES_0 ((1 << VIRTIO_GPU_F_VIRGL) | (1 << VIRTIO_GPU_F_CONTEXT_INIT) | (1 << VIRTIO_GPU_F_RESOURCE_UUID))
 #define __VGPU_FEATURES_1 1 // VIRTIO_F_VERSION_1
 #define __VGPU_QUEUE_NUM_MAX 1024
 #define __VGPU_QUEUE (vgpu->queues[vgpu->QueueSel])
@@ -563,11 +573,119 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
         desc_idx = desc[3] >> 16; \
     }
 
+#define __vgpu_assert_cond(COND, MESSAGE) \
+    if (!(COND)) { \
+        fprintf(stderr, "[VGPU] " MESSAGE ", failing\n"); \
+        return -1; \
+    }
+
+#define __vgpu_safe_cast(VAR, TYPE) \
+    TYPE *__tmp_ ## VAR = (TYPE *)VAR; \
+    TYPE *VAR = __tmp_ ## VAR; \
+    __vgpu_assert_cond(VAR ## _len >= sizeof(TYPE), #VAR " cannot hold " #TYPE);
+
+int virtiogpu_is_supported_capset(uint32_t capset) {
+    for (size_t i = 0; i < __VGPU_NUM_CAPSETS; i++)
+        if (capset == __VGPU_CAPSETS[i])
+            return true;
+    return false;
+}
+
+int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_gpu_ctrl_hdr *cmd, uint32_t cmd_len, struct virtio_gpu_ctrl_hdr *resp, uint32_t resp_len) {
+    if (cmd->type == VIRTIO_GPU_CMD_GET_CAPSET_INFO) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_get_capset_info);
+        __vgpu_assert_cond(cmd->capset_index < __VGPU_NUM_CAPSETS, "invalid capset index");
+        uint32_t capset = __VGPU_CAPSETS[cmd->capset_index];
+        __vgpu_safe_cast(resp, struct virtio_gpu_resp_capset_info);
+        resp->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
+
+        uint32_t max_ver, max_size;
+        virgl_renderer_get_cap_set(capset, &max_ver, &max_size);
+        resp->capset_id = capset;
+        resp->capset_max_version = max_ver;
+        resp->capset_max_size = max_size;
+        resp->padding = 0;
+        return sizeof(resp);
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_GET_CAPSET) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_get_capset);
+        uint32_t capset = cmd->capset_id;
+        __vgpu_assert_cond(virtiogpu_is_supported_capset(capset), "invalid capset");
+        __vgpu_safe_cast(resp, struct virtio_gpu_resp_capset);
+        resp->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
+
+        uint32_t max_ver, max_size;
+        virgl_renderer_get_cap_set(capset, &max_ver, &max_size);
+        void* caps = ((uint8_t*)resp) + sizeof(*resp);
+        uint32_t caps_len = resp_len - sizeof(*resp);
+        __vgpu_assert_cond(caps_len >= max_size, "out payload < max_size");
+        __vgpu_assert_cond(cmd->capset_version <= max_ver, "unsupported version");
+        memset(caps, 0, caps_len);
+        virgl_renderer_fill_caps(capset, cmd->capset_version, caps);
+        return resp_len;
+    }
+
+    return -1;
+}
+
+/*int virtiogpu_process_cursor_cmd(virtiogpu_state_t* vgpu, const struct virtio_gpu_ctrl_hdr *cmd, uint32_t cmd_len, struct virtio_gpu_ctrl_hdr *resp, uint32_t resp_len) {
+    // FIXME
+
+    return -1;
+}*/
+
+#undef __vgpu_assert_cond
+
+#define __vgpu_assert_cond(COND, MESSAGE) \
+    if (!(COND)) { \
+        fprintf(stderr, "[VGPU] " MESSAGE ", failing\n"); \
+        virtiogpu_set_fail(vgpu); \
+        return false; \
+    }
+
+// returns written length, or -1 to set fail status
+int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16_t buffer_idx) {
+    uint32_t* ram = vgpu->ram;
+    virtiogpu_queue_t* queue = &vgpu->queues[queue_idx];
+
+    // assume command and response have exactly 1 buffer descriptor each,
+    // SG not supported by now (not sure if we are supposed to)
+    __vgpu_assert_cond(buffer_idx < queue->QueueNum, "descriptor 1 bad addr");
+    const struct virtq_desc *cmd_desc = (struct virtq_desc*) &ram[queue->QueueDesc + buffer_idx * 4];
+    __vgpu_assert_cond(cmd_desc->flags & VIRTQ_DESC_F_NEXT, "less than 2 descriptors");;
+    buffer_idx = cmd_desc->next;
+    __vgpu_assert_cond(buffer_idx < queue->QueueNum, "descriptor 2 bad addr");
+    const struct virtq_desc *resp_desc = (struct virtq_desc*) &ram[queue->QueueDesc + buffer_idx * 4];
+    __vgpu_assert_cond(!(resp_desc->flags & VIRTQ_DESC_F_NEXT), "more than 2 descriptors");
+
+    __vgpu_assert_cond(!(cmd_desc->flags & VIRTQ_DESC_F_WRITE), "descriptor 1 is not READ");
+    __vgpu_assert_cond(resp_desc->flags & VIRTQ_DESC_F_WRITE, "descriptor 2 is not WRITE");
+    __vgpu_assert_cond(cmd_desc->len >= sizeof(struct virtio_gpu_ctrl_hdr), "descriptor 1 too short");
+    __vgpu_assert_cond(resp_desc->len >= sizeof(struct virtio_gpu_ctrl_hdr), "descriptor 2 too short");
+
+    const struct virtio_gpu_ctrl_hdr *cmd = (struct virtio_gpu_ctrl_hdr *) &vgpu->ram[__VGPU_PREPROCESS_ADDR(cmd_desc->addr)];
+    struct virtio_gpu_ctrl_hdr *resp = (struct virtio_gpu_ctrl_hdr *) &vgpu->ram[__VGPU_PREPROCESS_ADDR(resp_desc->addr)];
+
+    fprintf(stderr, "[VGPU] [%u] %s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", queue_idx, virtio_gpu_ctrl_type_to_string(cmd->type), cmd->flags, cmd->fence_id, cmd->ctx_id, cmd_desc->len - sizeof(struct virtio_gpu_ctrl_hdr));
+    fflush(stderr);
+
+    memset(resp, 0, sizeof(*resp));
+
+    if (queue_idx == __VGPU_QUEUE_CONTROL)
+        return virtiogpu_process_control_cmd(vgpu, cmd, cmd_desc->len, resp, resp_desc->len);
+    // if (queue_idx == __VGPU_QUEUE_CURSOR)
+    //     return virtiogpu_process_cursor_cmd(vgpu, cmd, cmd_desc->len, resp, resp_desc->len);
+    return -1;
+}
+
+#undef __vgpu_assert_cond
+
 #define __VGPU_GENERATE_QUEUE_HANDLER(NAME_SUFFIX, QUEUE_IDX) \
     void __virtiogpu_try_##NAME_SUFFIX(virtiogpu_state_t* vgpu) { \
         uint32_t* ram = vgpu->ram; \
         virtiogpu_queue_t* queue = &vgpu->queues[QUEUE_IDX]; \
-        if ((vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) || !queue->fd_ready) \
+        if ((vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)) \
             return; \
         if (!( (vgpu->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready )) \
             return virtiogpu_set_fail(vgpu); \
@@ -584,20 +702,12 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
         while (queue->last_avail != new_avail) { \
             uint16_t queue_idx = queue->last_avail % queue->QueueNum; \
             uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >> (16 * (queue_idx % 2)); \
-            printf("[BUFFER]\n"); \
-            uint16_t desc_idx; __VGPU_ITERATE_BUFFER(true, \
-                printf("desc %#x: flags %u, len %u, %s\n", desc_idx, desc_flags & ~(VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT), desc[2], (desc_flags & VIRTQ_DESC_F_WRITE) ? "WRITE" : "READ"); \
-                if (!(desc_flags & VIRTQ_DESC_F_WRITE)) { \
-                    if (desc[2] < sizeof(struct virtio_gpu_ctrl_hdr)) \
-                        return virtiogpu_set_fail(vgpu); \
-                    struct virtio_gpu_ctrl_hdr *hdr = (struct virtio_gpu_ctrl_hdr *) &vgpu->ram[desc[0] >> 2]; \
-                    printf("  type: %32s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", virtio_gpu_ctrl_type_to_string(hdr->type), hdr->flags, hdr->fence_id, hdr->ctx_id, desc[2] - sizeof(struct virtio_gpu_ctrl_hdr)); \
-                } \
-            ) \
+            int resp_len = virtiogpu_process_buffer(vgpu, QUEUE_IDX, buffer_idx); \
+            if (resp_len < 0) return virtiogpu_set_fail(vgpu); \
             /* consume from available queue, write to used queue */ \
             queue->last_avail++; \
             ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] = buffer_idx; \
-            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = 0 /*FIXME*/; \
+            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = resp_len; \
             new_used++; \
         } \
         vgpu->ram[queue->QueueUsed] &= MASK(16); \
@@ -667,7 +777,6 @@ void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
             W( \
                 if (value & 1) \
                     __VGPU_QUEUE.last_avail = vgpu->ram[__VGPU_QUEUE.QueueAvail] >> 16; \
-                vgpu->ram[__VGPU_QUEUE.QueueAvail] |= 1; /* set VIRTQ_AVAIL_F_NO_INTERRUPT */ \
             ) \
             return true; \
         W(case 32: /* QueueDescLow (W) */ \
@@ -716,9 +825,9 @@ void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
         W(case 65: /* events_clear */ \
             vgpu->pending_events &= ~value; return true;) \
         R(case 66: /* num_scanouts */ \
-            *value = 1; return true;) \
+            *value = __VGPU_NUM_SCANOUTS; return true;) \
         R(case 67: /* num_capsets */ \
-            *value = 0; return true;) \
+            *value = __VGPU_NUM_CAPSETS; return true;) \
         default: return false; \
     }
 
