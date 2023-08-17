@@ -584,6 +584,23 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
     TYPE *VAR = __tmp_ ## VAR; \
     __vgpu_assert_cond(VAR ## _len >= sizeof(TYPE), #VAR " cannot hold " #TYPE);
 
+#define __vgpu_check_ret(RESP, VALUE) { \
+    int __err = (VALUE); \
+    if (__err) fprintf(stderr, "[VGPU] failed with %s\n", strerror(__err)); \
+    if (!__err) { \
+        (RESP).type = VIRTIO_GPU_RESP_OK_NODATA; \
+    } else if (__err == EINVAL) { \
+        (RESP).type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER; \
+        return sizeof(RESP); \
+    } else if (__err == ENOMEM) { \
+        (RESP).type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY; \
+        return sizeof(RESP); \
+    } else if (__err) { \
+        fprintf(stderr, "[VGPU] unknown code, failing\n"); \
+        return -1; \
+    } \
+}
+
 int virtiogpu_is_supported_capset(uint32_t capset) {
     for (size_t i = 0; i < __VGPU_NUM_CAPSETS; i++)
         if (capset == __VGPU_CAPSETS[i])
@@ -605,7 +622,7 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         resp->capset_max_version = max_ver;
         resp->capset_max_size = max_size;
         resp->padding = 0;
-        return sizeof(resp);
+        return sizeof(*resp);
     }
 
     if (cmd->type == VIRTIO_GPU_CMD_GET_CAPSET) {
@@ -624,6 +641,32 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         memset(caps, 0, caps_len);
         virgl_renderer_fill_caps(capset, cmd->capset_version, caps);
         return resp_len;
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_GET_DISPLAY_INFO) {
+        __vgpu_safe_cast(resp, struct virtio_gpu_resp_display_info);
+        memset(resp, 0, sizeof(*resp));
+        resp->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
+        resp->pmodes[0].enabled = 0;
+        resp->pmodes[0].r.x = 0;
+        resp->pmodes[0].r.y = 0;
+        resp->pmodes[0].r.width = 800;
+        resp->pmodes[0].r.height = 600;
+        return sizeof(*resp);
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_CTX_CREATE) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_ctx_create);
+        __vgpu_assert_cond(cmd->nlen < sizeof(cmd->debug_name), "debugging name does not fit");
+        __vgpu_check_ret(*resp, virgl_renderer_context_create_with_flags(cmd->hdr.ctx_id, cmd->context_init, cmd->nlen, cmd->debug_name));
+        return sizeof(*resp);
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_CTX_DESTROY) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_ctx_destroy);
+        virgl_renderer_context_destroy(cmd->hdr.ctx_id);
+        resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+        return sizeof(*resp);
     }
 
     return -1;
@@ -668,15 +711,20 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
     struct virtio_gpu_ctrl_hdr *resp = (struct virtio_gpu_ctrl_hdr *) &vgpu->ram[__VGPU_PREPROCESS_ADDR(resp_desc->addr)];
 
     fprintf(stderr, "[VGPU] [%u] %s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", queue_idx, virtio_gpu_ctrl_type_to_string(cmd->type), cmd->flags, cmd->fence_id, cmd->ctx_id, cmd_desc->len - sizeof(struct virtio_gpu_ctrl_hdr));
-    fflush(stderr);
 
     memset(resp, 0, sizeof(*resp));
 
+    int ret = -1;
     if (queue_idx == __VGPU_QUEUE_CONTROL)
-        return virtiogpu_process_control_cmd(vgpu, cmd, cmd_desc->len, resp, resp_desc->len);
+        ret = virtiogpu_process_control_cmd(vgpu, cmd, cmd_desc->len, resp, resp_desc->len);
     // if (queue_idx == __VGPU_QUEUE_CURSOR)
-    //     return virtiogpu_process_cursor_cmd(vgpu, cmd, cmd_desc->len, resp, resp_desc->len);
-    return -1;
+    //     ret = virtiogpu_process_cursor_cmd(vgpu, cmd, cmd_desc->len, resp, resp_desc->len);
+
+    assert(ret < 0 || ret >= (int)(sizeof(struct virtio_gpu_ctrl_hdr)));
+    if (ret >= 0)
+        fprintf(stderr, "[VGPU]   -> %s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", virtio_gpu_ctrl_type_to_string(resp->type), resp->flags, resp->fence_id, resp->ctx_id, ret - sizeof(struct virtio_gpu_ctrl_hdr));
+    fflush(stderr);
+    return ret;
 }
 
 #undef __vgpu_assert_cond
