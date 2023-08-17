@@ -698,8 +698,18 @@ void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
             W(virtiogpu_update_status(vgpu, value);) \
             return true; \
         \
+        W(case 43: /* SHMSel (W) */ \
+            return true;) \
+        R(case 44: case 45: /* SHMLenLow / SHMLenHigh (R) */ \
+            *value = -1; /* signal SHM not implemented */ return true; ) \
+        R(case 46: case 47: /* SHMBaseLow / SHMBaseHigh (R) */ \
+            *value = -1; /* signal SHM not implemented */ return true; ) \
+        \
+        /* case 48: */ /* QueueReset (RW) */ \
+        \
         R(case 63: /* ConfigGeneration (R) */ \
             *value = 0; return true;) \
+        \
         /* device-specific configuration space */ \
         R(case 64: /* events_read */ \
             *value = vgpu->pending_events; return true;) \
@@ -1054,6 +1064,7 @@ int main() {
         fprintf(stderr, "failed to initialize virgl renderer\n");
         return 2;
     }
+    data.gpu.ram = data.ram;
 
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);
