@@ -608,7 +608,7 @@ int virtiogpu_is_supported_capset(uint32_t capset) {
     return false;
 }
 
-int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_gpu_ctrl_hdr *cmd, uint32_t cmd_len, struct virtio_gpu_ctrl_hdr *resp, uint32_t resp_len) {
+int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_gpu_ctrl_hdr *cmd, uint32_t cmd_len, const void *data, uint32_t data_len, struct virtio_gpu_ctrl_hdr *resp, uint32_t resp_len) {
     if (cmd->type == VIRTIO_GPU_CMD_GET_CAPSET_INFO) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_get_capset_info);
         __vgpu_assert_cond(cmd->capset_index < __VGPU_NUM_CAPSETS, "invalid capset index");
@@ -669,10 +669,18 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         return sizeof(*resp);
     }
 
+    if (cmd->type == VIRTIO_GPU_CMD_SUBMIT_3D) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_cmd_submit);
+        uint32_t size = cmd->size;
+        __vgpu_assert_cond(cmd_len == sizeof(*cmd) && data && data_len >= size, "unexpected layout...");
+        __vgpu_check_ret(*resp, virgl_renderer_submit_cmd(data, cmd->hdr.ctx_id, size));
+        return sizeof(*resp);
+    }
+
     return -1;
 }
 
-/*int virtiogpu_process_cursor_cmd(virtiogpu_state_t* vgpu, const struct virtio_gpu_ctrl_hdr *cmd, uint32_t cmd_len, struct virtio_gpu_ctrl_hdr *resp, uint32_t resp_len) {
+/*int virtiogpu_process_cursor_cmd(virtiogpu_state_t* vgpu, const struct virtio_gpu_ctrl_hdr *cmd, uint32_t cmd_len, const void *data, uint32_t data_len, struct virtio_gpu_ctrl_hdr *resp, uint32_t resp_len) {
     // FIXME
 
     return -1;
@@ -700,6 +708,13 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
     buffer_idx = cmd_desc->next;
     __vgpu_assert_cond(buffer_idx < queue->QueueNum, "descriptor 2 bad addr");
     const struct virtq_desc *resp_desc = (struct virtq_desc*) &ram[queue->QueueDesc + buffer_idx * 4];
+    const struct virtq_desc *data_desc = NULL;
+    if (resp_desc->flags & VIRTQ_DESC_F_NEXT) {
+        data_desc = resp_desc;
+        buffer_idx = data_desc->next;
+        resp_desc = (struct virtq_desc*) &ram[queue->QueueDesc + buffer_idx * 4];
+        __vgpu_assert_cond(!(data_desc->flags & VIRTQ_DESC_F_WRITE), "middle descriptor is not READ");
+    }
     __vgpu_assert_cond(!(resp_desc->flags & VIRTQ_DESC_F_NEXT), "more than 2 descriptors");
 
     __vgpu_assert_cond(!(cmd_desc->flags & VIRTQ_DESC_F_WRITE), "descriptor 1 is not READ");
@@ -709,6 +724,8 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
 
     const struct virtio_gpu_ctrl_hdr *cmd = (struct virtio_gpu_ctrl_hdr *) &vgpu->ram[__VGPU_PREPROCESS_ADDR(cmd_desc->addr)];
     struct virtio_gpu_ctrl_hdr *resp = (struct virtio_gpu_ctrl_hdr *) &vgpu->ram[__VGPU_PREPROCESS_ADDR(resp_desc->addr)];
+    const void* data = data_desc ? &vgpu->ram[__VGPU_PREPROCESS_ADDR(data_desc->addr)] : NULL;
+    uint32_t data_len = data_desc ? data_desc->len : 0;
 
     fprintf(stderr, "[VGPU] [%u] %s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", queue_idx, virtio_gpu_ctrl_type_to_string(cmd->type), cmd->flags, cmd->fence_id, cmd->ctx_id, cmd_desc->len - sizeof(struct virtio_gpu_ctrl_hdr));
 
@@ -716,9 +733,9 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
 
     int ret = -1;
     if (queue_idx == __VGPU_QUEUE_CONTROL)
-        ret = virtiogpu_process_control_cmd(vgpu, cmd, cmd_desc->len, resp, resp_desc->len);
+        ret = virtiogpu_process_control_cmd(vgpu, cmd, cmd_desc->len, data, data_len, resp, resp_desc->len);
     // if (queue_idx == __VGPU_QUEUE_CURSOR)
-    //     ret = virtiogpu_process_cursor_cmd(vgpu, cmd, cmd_desc->len, resp, resp_desc->len);
+    //     ret = virtiogpu_process_cursor_cmd(vgpu, cmd, cmd_desc->len, data, data_len, resp, resp_desc->len);
 
     assert(ret < 0 || ret >= (int)(sizeof(struct virtio_gpu_ctrl_hdr)));
     if (ret >= 0)
