@@ -517,6 +517,14 @@ typedef struct {
     bool fd_ready;
 } virtiogpu_queue_t;
 
+typedef struct virtiogpu_request_list_t {
+    uint32_t fence_id;
+    uint32_t buffer_idx;
+    uint32_t len;
+    struct virtiogpu_request_list_t *prev;
+    struct virtiogpu_request_list_t *next;
+} virtiogpu_request_list_t;
+
 typedef struct {
     // feature negotiation
     uint32_t DeviceFeaturesSel;
@@ -530,6 +538,9 @@ typedef struct {
     uint32_t InterruptStatus;
     // device specific config
     uint32_t pending_events;
+    uint32_t next_fence_id;
+    virtiogpu_request_list_t *fenced_cmds_head;
+    virtiogpu_request_list_t *fenced_cmds_tail;
     // supplied by environment
     uint32_t* ram;
 } virtiogpu_state_t;
@@ -552,6 +563,11 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
     vgpu->Status |= status;
     if (!status) { // reset
         //int tap_fd = vgpu->tap_fd;
+        while (vgpu->fenced_cmds_head) {
+            virtiogpu_request_list_t *next = vgpu->fenced_cmds_head->next;
+            free(vgpu->fenced_cmds_head);
+            vgpu->fenced_cmds_head = next;
+        }
         uint32_t* ram = vgpu->ram;
         memset(vgpu, 0, sizeof(*vgpu));
         //vgpu->tap_fd = tap_fd;
@@ -695,24 +711,25 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         return false; \
     }
 
-// returns written length, or -1 to set fail status
+// returns written length, or -1 to set fail status, or -2 to just skip returning buffer
 int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16_t buffer_idx) {
     uint32_t* ram = vgpu->ram;
     virtiogpu_queue_t* queue = &vgpu->queues[queue_idx];
+    uint32_t desc_idx = buffer_idx;
 
     // assume command and response have exactly 1 buffer descriptor each,
     // SG not supported by now (not sure if we are supposed to)
-    __vgpu_assert_cond(buffer_idx < queue->QueueNum, "descriptor 1 bad addr");
-    const struct virtq_desc *cmd_desc = (struct virtq_desc*) &ram[queue->QueueDesc + buffer_idx * 4];
+    __vgpu_assert_cond(desc_idx < queue->QueueNum, "descriptor 1 bad addr");
+    const struct virtq_desc *cmd_desc = (struct virtq_desc*) &ram[queue->QueueDesc + desc_idx * 4];
     __vgpu_assert_cond(cmd_desc->flags & VIRTQ_DESC_F_NEXT, "less than 2 descriptors");;
-    buffer_idx = cmd_desc->next;
-    __vgpu_assert_cond(buffer_idx < queue->QueueNum, "descriptor 2 bad addr");
-    const struct virtq_desc *resp_desc = (struct virtq_desc*) &ram[queue->QueueDesc + buffer_idx * 4];
+    desc_idx = cmd_desc->next;
+    __vgpu_assert_cond(desc_idx < queue->QueueNum, "descriptor 2 bad addr");
+    const struct virtq_desc *resp_desc = (struct virtq_desc*) &ram[queue->QueueDesc + desc_idx * 4];
     const struct virtq_desc *data_desc = NULL;
     if (resp_desc->flags & VIRTQ_DESC_F_NEXT) {
         data_desc = resp_desc;
-        buffer_idx = data_desc->next;
-        resp_desc = (struct virtq_desc*) &ram[queue->QueueDesc + buffer_idx * 4];
+        desc_idx = data_desc->next;
+        resp_desc = (struct virtq_desc*) &ram[queue->QueueDesc + desc_idx * 4];
         __vgpu_assert_cond(!(data_desc->flags & VIRTQ_DESC_F_WRITE), "middle descriptor is not READ");
     }
     __vgpu_assert_cond(!(resp_desc->flags & VIRTQ_DESC_F_NEXT), "more than 2 descriptors");
@@ -741,6 +758,32 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
     if (ret >= 0)
         fprintf(stderr, "[VGPU]   -> %s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", virtio_gpu_ctrl_type_to_string(resp->type), resp->flags, resp->fence_id, resp->ctx_id, ret - sizeof(struct virtio_gpu_ctrl_hdr));
     fflush(stderr);
+
+    if (ret >= 0 && (cmd->flags & VIRTIO_GPU_FLAG_FENCE) && resp->type == VIRTIO_GPU_RESP_OK_NODATA) {
+        __vgpu_assert_cond(queue_idx == __VGPU_QUEUE_CONTROL, "fences not implemented for cursor ops");
+        // copy fence to response
+        resp->flags |= VIRTIO_GPU_FLAG_FENCE;
+        resp->fence_id = cmd->fence_id;
+        // create fence
+        uint32_t fence_id = vgpu->next_fence_id++;
+        __vgpu_check_ret(*resp, virgl_renderer_create_fence((int)fence_id, 0));
+        // allocate & initialize queue item
+        virtiogpu_request_list_t *item = malloc(sizeof(*item));
+        if (!item) {
+            resp->type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            return sizeof(*resp);
+        }
+        item->buffer_idx = buffer_idx;
+        item->len = ret;
+        item->fence_id = fence_id;
+        // add it to queue
+        item->prev = NULL;
+        item->next = vgpu->fenced_cmds_head;
+        *(vgpu->fenced_cmds_head ? &vgpu->fenced_cmds_head->prev : &vgpu->fenced_cmds_tail) = item;
+        vgpu->fenced_cmds_head = item;
+        // return -2 to tell queue handler not to return buffer yet
+        return -2;
+    }
     return ret;
 }
 
@@ -768,9 +811,10 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
             uint16_t queue_idx = queue->last_avail % queue->QueueNum; \
             uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >> (16 * (queue_idx % 2)); \
             int resp_len = virtiogpu_process_buffer(vgpu, QUEUE_IDX, buffer_idx); \
-            if (resp_len < 0) return virtiogpu_set_fail(vgpu); \
+            if (resp_len == -1) return virtiogpu_set_fail(vgpu); \
             /* consume from available queue, write to used queue */ \
             queue->last_avail++; \
+            if (resp_len < 0) continue; \
             ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] = buffer_idx; \
             ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = resp_len; \
             new_used++; \
@@ -793,10 +837,45 @@ void virtiogpu_notify_queue(virtiogpu_state_t* vgpu, uint32_t queueIdx) {
     }
 }
 
+void virtiogpu_cb_write_fence(void *cookie, uint32_t fence) {
+    virtiogpu_state_t* vgpu = (virtiogpu_state_t*) cookie;
+    if ((vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
+        return;
+
+    uint32_t QUEUE_IDX = __VGPU_QUEUE_CONTROL;
+    uint32_t* ram = vgpu->ram;
+    virtiogpu_queue_t* queue = &vgpu->queues[QUEUE_IDX];
+    uint16_t new_used = ram[queue->QueueUsed] >> 16;
+
+    while (true) {
+        // check we have an item to dequeue and it's not past our target
+        virtiogpu_request_list_t *item = vgpu->fenced_cmds_tail;
+        int32_t diff;
+        assert(item && (diff = (int32_t)(fence - item->fence_id)) >= 0);
+        // return buffer
+        ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] = item->buffer_idx;
+        ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = item->len;
+        new_used++;
+        // dequeue it
+        *(item->prev ? &item->prev->next : &vgpu->fenced_cmds_head) = NULL;
+        vgpu->fenced_cmds_tail = item->prev;
+        free(item);
+
+        if (diff == 0) break;
+    }
+
+    // update ringbuffer
+    vgpu->ram[queue->QueueUsed] &= MASK(16);
+    vgpu->ram[queue->QueueUsed] |= ((uint32_t)new_used) << 16;
+    /* send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */
+    if (!(ram[queue->QueueAvail] & 1))
+        vgpu->InterruptStatus |= VIRTIO_INT__USED_RING;
+}
+
 void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
     if (!(vgpu->Status & VIRTIO_STATUS__DRIVER_OK) || (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
         return;
-    // FIXME
+    virgl_renderer_poll();
 }
 
 #define __virtiogpu_body(R, W) \
@@ -1233,8 +1312,8 @@ int main() {
     struct virgl_renderer_callbacks virgl_cbs;
     memset(&virgl_cbs, 0, sizeof(virgl_cbs));
     virgl_cbs.version = VIRGL_RENDERER_CALLBACKS_VERSION;
-    // TODO: write_fence cb?
-    if (virgl_renderer_init(&data, virgl_flags, &virgl_cbs)) {
+    virgl_cbs.write_fence = virtiogpu_cb_write_fence;
+    if (virgl_renderer_init(&data.gpu, virgl_flags, &virgl_cbs)) {
         fprintf(stderr, "failed to initialize virgl renderer\n");
         return 2;
     }
