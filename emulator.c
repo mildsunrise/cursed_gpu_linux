@@ -562,7 +562,6 @@ void virtiogpu_set_fail(virtiogpu_state_t* vgpu) {
 void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
     vgpu->Status |= status;
     if (!status) { // reset
-        //int tap_fd = vgpu->tap_fd;
         while (vgpu->fenced_cmds_head) {
             virtiogpu_request_list_t *next = vgpu->fenced_cmds_head->next;
             free(vgpu->fenced_cmds_head);
@@ -570,8 +569,8 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
         }
         uint32_t* ram = vgpu->ram;
         memset(vgpu, 0, sizeof(*vgpu));
-        //vgpu->tap_fd = tap_fd;
         vgpu->ram = ram;
+        virgl_renderer_reset();
     }
     fprintf(stderr, "[VGPU] status: %s\n", virtio_status_to_string(vgpu->Status));
 }
@@ -602,7 +601,6 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
 
 #define __vgpu_check_ret(RESP, VALUE) { \
     int __err = (VALUE); \
-    if (__err) fprintf(stderr, "[VGPU] failed with %s\n", strerror(__err)); \
     if (!__err) { \
         (RESP).type = VIRTIO_GPU_RESP_OK_NODATA; \
     } else if (__err == EINVAL) { \
@@ -612,7 +610,7 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
         (RESP).type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY; \
         return sizeof(RESP); \
     } else if (__err) { \
-        fprintf(stderr, "[VGPU] unknown code, failing\n"); \
+        fprintf(stderr, "[VGPU] unknown code %s, failing\n", strerror(__err)); \
         return -1; \
     } \
 }
@@ -689,7 +687,7 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         __vgpu_safe_cast(cmd, const struct virtio_gpu_cmd_submit);
         uint32_t size = cmd->size;
         __vgpu_assert_cond(cmd_len == sizeof(*cmd) && data && data_len >= size, "unexpected layout...");
-        __vgpu_check_ret(*resp, virgl_renderer_submit_cmd(data, cmd->hdr.ctx_id, size));
+        __vgpu_check_ret(*resp, virgl_renderer_submit_cmd(data, cmd->hdr.ctx_id, size / sizeof(uint32_t)));
         return sizeof(*resp);
     }
 
@@ -701,15 +699,6 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
 
     return -1;
 }*/
-
-#undef __vgpu_assert_cond
-
-#define __vgpu_assert_cond(COND, MESSAGE) \
-    if (!(COND)) { \
-        fprintf(stderr, "[VGPU] " MESSAGE ", failing\n"); \
-        virtiogpu_set_fail(vgpu); \
-        return false; \
-    }
 
 // returns written length, or -1 to set fail status, or -2 to just skip returning buffer
 int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16_t buffer_idx) {
@@ -747,6 +736,7 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
     fprintf(stderr, "[VGPU] [%u] %s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", queue_idx, virtio_gpu_ctrl_type_to_string(cmd->type), cmd->flags, cmd->fence_id, cmd->ctx_id, cmd_desc->len - sizeof(struct virtio_gpu_ctrl_hdr));
 
     memset(resp, 0, sizeof(*resp));
+    resp->ctx_id = cmd->ctx_id;
 
     int ret = -1;
     if (queue_idx == __VGPU_QUEUE_CONTROL)
@@ -786,8 +776,6 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
     }
     return ret;
 }
-
-#undef __vgpu_assert_cond
 
 #define __VGPU_GENERATE_QUEUE_HANDLER(NAME_SUFFIX, QUEUE_IDX) \
     void __virtiogpu_try_##NAME_SUFFIX(virtiogpu_state_t* vgpu) { \
