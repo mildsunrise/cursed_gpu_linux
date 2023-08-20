@@ -691,6 +691,60 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         return sizeof(*resp);
     }
 
+    if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_CREATE_3D) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_create_3d);
+        __vgpu_check_ret(*resp, virgl_renderer_resource_create((struct virgl_renderer_resource_create_args *)&cmd->resource_id, NULL, 0));
+        return sizeof(*resp);
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_attach_backing);
+        // check for data, allocate space for iov list
+        const struct virtio_gpu_mem_entry *iovs_src = (struct virtio_gpu_mem_entry *)data;
+        __vgpu_assert_cond(data_len >= cmd->nr_entries * sizeof(*iovs_src), "message too short");
+        struct iovec *iovs = (struct iovec *) malloc(cmd->nr_entries * sizeof(*iovs));
+        if (!iovs) {
+            resp->type = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            return sizeof(*resp);
+        }
+        // convert iovs
+        for (size_t i = 0; i < cmd->nr_entries; i++) {
+            iovs[i].iov_base = &vgpu->ram[__VGPU_PREPROCESS_ADDR(iovs_src[i].addr)];
+            iovs[i].iov_len = iovs_src[i].length;
+        }
+        // attach them
+        int ret = virgl_renderer_resource_attach_iov(cmd->resource_id, iovs, cmd->nr_entries);
+        if (ret) free(iovs);
+        __vgpu_check_ret(*resp, ret);
+        return sizeof(*resp);
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_detach_backing);
+        struct iovec *iovs = NULL;
+        virgl_renderer_resource_detach_iov(cmd->resource_id, &iovs, NULL);
+        free(iovs);
+        resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+        return sizeof(*resp);
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_UNREF) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_unref);
+        struct iovec *iovs = NULL;
+        virgl_renderer_resource_detach_iov(cmd->resource_id, &iovs, NULL);
+        free(iovs);
+        virgl_renderer_resource_unref(cmd->resource_id);
+        resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+        return sizeof(*resp);
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE || cmd->type == VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_ctx_resource);
+        (cmd->hdr.type == VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE ? virgl_renderer_ctx_attach_resource : virgl_renderer_ctx_detach_resource)(cmd->hdr.ctx_id, cmd->resource_id);
+        resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+        return sizeof(*resp);
+    }
+
     return -1;
 }
 
