@@ -56,6 +56,11 @@ const char* core_exc_cause_str(uint32_t cause);
 // callbacks to halt instruction execution and cause core_step() to return.
 // unless it's from a fetch, pc will be advanced, so the same applies.
 
+typedef struct {
+    uint32_t page_num;
+    uint32_t *page_addr;
+} mmu_cache_t;
+
 typedef struct _core_t core_t;
 struct _core_t {
     uint32_t x_regs [32];
@@ -75,6 +80,8 @@ struct _core_t {
     // if error == ERR_EXCEPTION, these specify values that will go in
     // scause & stval if turned into a trap. see RISC-V spec for meaning
     uint32_t exc_cause, exc_val;
+
+    mmu_cache_t cache_fetch;
 
     // supervisor state
     bool s_mode;
@@ -98,7 +105,7 @@ struct _core_t {
     // ENVIRONMENT SUPPLIED
     void* user_data;
     // memory access. sets core->error on failure, reads/writes `value` otherwise.
-    void (*mem_fetch)(core_t* core, uint32_t addr, uint32_t* value);
+    void (*mem_fetch)(core_t* core, uint32_t page_num, uint32_t** page_addr);
     void (*mem_load)(core_t* core, uint32_t addr, uint8_t width, uint32_t* value);
     void (*mem_store)(core_t* core, uint32_t addr, uint8_t width, uint32_t value);
     // pre-validates that the required page number can hold a page table,

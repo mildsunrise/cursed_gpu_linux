@@ -100,9 +100,14 @@ uint32_t __core_read_rs2(const core_t* core, uint32_t instr) {
 
 // VIRTUAL ADDRESSING
 
+void __core_mmu_invalidate(core_t *core) {
+    core->cache_fetch.page_num = 0xFFFFFFFF;
+}
+
 // we pre-verify the root page table, so that
 // at most 1 page table access is done at translation time
 void __core_mmu_set(core_t* core, uint32_t satp) {
+    __core_mmu_invalidate(core);
     if (satp >> 31) {
         uint32_t* page_table = core->mem_page_table(core, satp & MASK(22));
         if (!page_table) return;
@@ -185,18 +190,26 @@ void __core_mmu_translate(core_t* core, uint32_t *addr, uint32_t access_bits, ui
     *addr = ((*addr) & MASK(RISCV_PAGE_SHIFT)) | (ppn << RISCV_PAGE_SHIFT);
 }
 
-void __core_mmu_fence(core_t* /*core*/, uint32_t /*instr*/) {
-    // no-op for now
+void __core_mmu_fence(core_t *core, uint32_t /*instr*/) {
+    __core_mmu_invalidate(core);
 }
 
 void __core_mmu_fetch(core_t* core, uint32_t addr, uint32_t* value) {
+    uint32_t vpn = addr >> RISCV_PAGE_SHIFT;
+    if (unlikely(vpn != core->cache_fetch.page_num)) {
     __core_mmu_translate(core, &addr,
         (1 << 3),
         (1 << 6),
         false,
         RISCV_EXC_FETCH_FAULT, RISCV_EXC_FETCH_PFAULT);
     if (core->error) return;
-    core->mem_fetch(core, addr, value);
+    uint32_t *page_addr;
+    core->mem_fetch(core, addr >> RISCV_PAGE_SHIFT, &page_addr);
+    if (core->error) return;
+    core->cache_fetch.page_num = vpn;
+    core->cache_fetch.page_addr = page_addr;
+    }
+    *value = core->cache_fetch.page_addr[(addr >> 2) & MASK(RISCV_PAGE_SHIFT - 2)];
 }
 
 void __core_mmu_load(core_t* core, uint32_t addr, uint8_t width, uint32_t* value, bool reserved) {
@@ -254,6 +267,7 @@ void core_trap(core_t* core) {
 
     // set stuff
     core->sstatus_sie = false;
+    __core_mmu_invalidate(core);
     core->s_mode = true;
     core->pc = core->stvec_addr;
     if (core->stvec_vectored)
@@ -265,6 +279,7 @@ void core_trap(core_t* core) {
 void __core_do_sret(core_t* core) {
     // restore stuff from stack
     core->pc = core->sepc;
+    __core_mmu_invalidate(core);
     core->s_mode = core->sstatus_spp;
     core->sstatus_sie = core->sstatus_spie;
 
@@ -530,6 +545,7 @@ void __core_do_amo(core_t* core, uint32_t instr) {
 
 void core_init(core_t* core) {
     memset(core, 0, sizeof(*core));
+    __core_mmu_invalidate(core);
 }
 
 void core_step(core_t* core) {

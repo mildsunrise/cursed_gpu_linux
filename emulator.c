@@ -1138,14 +1138,14 @@ typedef struct {
 
 // we define fetch separately because it's much simpler (width is fixed,
 // alignment already checked, only main RAM is executable)
-static void mem_fetch(core_t* core, uint32_t addr, uint32_t* value) {
+static void mem_fetch(core_t* core, uint32_t page_num, uint32_t** page_addr) {
     emu_state_t *data = (emu_state_t *)core->user_data;
-    if (unlikely(addr >= RAM_SIZE)) {
+    if (unlikely(page_num >= RAM_SIZE / RISCV_PAGE_SIZE)) {
         // FIXME: check for other regions
         core_set_exception(core, RISCV_EXC_FETCH_FAULT, core->exc_val);
         return;
     }
-    *value = data->ram[addr >> 2];
+    *page_addr = &data->ram[page_num << (RISCV_PAGE_SHIFT - 2)];
 }
 
 // similarly only main memory pages can be used as page_tables
