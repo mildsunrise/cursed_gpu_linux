@@ -18,9 +18,8 @@ const char* core_exc_cause_str(uint32_t cause);
 
 // # Introduction
 //
-// to use the emulator, zero-initialize a core_t struct (I'm too lazy to
-// make an init function) and set the environment-supplied callbacks.
-// all of them are currently required.
+// to use the emulator, call core_init() and then set the
+// environment-supplied callbacks. all of them are currently required.
 //
 // set any other field you need (argument registers and s_mode are frequent,
 // though they all have sane defaults). some fields only admit a subset of
@@ -106,6 +105,9 @@ struct _core_t {
     // and returns a uint32_t* to said page. if not valid, return NULL
     uint32_t* (*mem_page_table)(const core_t* core, uint32_t ppn);
 };
+
+// initialize the core structure. zeroes user-supplied fields too.
+void core_init(core_t* core);
 
 // (try to) emulate the next instruction. no-op if error is set.
 void core_step(core_t* core);

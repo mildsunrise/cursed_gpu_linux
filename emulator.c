@@ -1300,7 +1300,7 @@ int main() {
     emu_state_t data;
     memset(&data, 0, sizeof(data));
     core_t core;
-    memset(&core, 0, sizeof(core));
+    core_init(&core);
     core.user_data = &data;
     core.mem_fetch = mem_fetch;
     core.mem_load = mem_read;

@@ -1,6 +1,7 @@
 #include "core.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include "reg_macros.h"
 
 #define MASK(n) (~((~0U << (n))))
@@ -525,6 +526,10 @@ void __core_do_amo(core_t* core, uint32_t instr) {
         default:
             core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); return;
     }
+}
+
+void core_init(core_t* core) {
+    memset(core, 0, sizeof(*core));
 }
 
 void core_step(core_t* core) {
