@@ -1132,8 +1132,7 @@ typedef struct {
     u8250_state_t uart;
     virtionet_state_t vnet;
     virtiogpu_state_t gpu;
-    uint32_t timer_l;
-    uint32_t timer_h;
+    uint64_t timer;
 } emu_state_t;
 
 // we define fetch separately because it's much simpler (width is fixed,
@@ -1219,8 +1218,7 @@ sbiret_t handle_sbi_ecall_TIMER(core_t* core, int32_t fid) {
     emu_state_t *data = (emu_state_t *)core->user_data;
     switch (fid) {
         case SBI_TIMER__SET_TIMER:
-            data->timer_l = core->x_regs[RISCV_R_A0];
-            data->timer_h = core->x_regs[RISCV_R_A1];
+            data->timer = (((uint64_t)core->x_regs[RISCV_R_A1]) << 32) | (uint64_t)(core->x_regs[RISCV_R_A0]);
             return (sbiret_t){ SBI_SUCCESS, 0 };
     }
     return (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
@@ -1322,7 +1320,7 @@ int main() {
     ram_cursor = ((char*)data.ram) + dtb_addr;
     read_file_into_ram(&ram_cursor, "linux_dtb");
 
-    data.timer_h = data.timer_l = 0xFFFFFFFF;
+    data.timer = 0xFFFFFFFFFFFFFFFF;
     core.s_mode = true;
     core.x_regs[RISCV_R_A0] = 0; // hart ID (cpuid)
     core.x_regs[RISCV_R_A1] = dtb_addr;
@@ -1390,8 +1388,7 @@ int main() {
                 emulator_update_vgpu_interrupts(&core);
         }
 
-        bool timer_active = core.instr_count_h > data.timer_h || (core.instr_count_h == data.timer_h && core.instr_count > data.timer_l);
-        timer_active ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
+        (core.instr_count > data.timer) ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
 
         core_step(&core);
         if (likely(!core.error)) continue;
@@ -1418,7 +1415,7 @@ int main() {
     int64_t elapsed = ((int64_t)end.tv_sec - (int64_t)start.tv_sec) * 1000000000 + ((int64_t)end.tv_nsec - (int64_t)start.tv_nsec);
     long long host_instr_count = simple_perf_read(instr_count_fd);
     long long host_cycle_count = simple_perf_read(cycle_count_fd);
-    fprintf(stderr, "executed %u instructions in %.3f ms, %lld instructions, %lld cycles\n",
+    fprintf(stderr, "executed %lu instructions in %.3f ms, %lld instructions, %lld cycles\n",
         core.instr_count, elapsed / 1e6, host_instr_count, host_cycle_count);
     fprintf(stderr, "stats: %.3f c/i, %.1f i/I, %.1f c/I, %.1f MIps\n",
         ((double)host_cycle_count) / ((double)host_instr_count),

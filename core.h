@@ -73,7 +73,7 @@ struct _core_t {
     // 'instructions executed' 64-bit counter. currently used
     // as "real-time clock", instruction-retired counter, and cycle counter.
     // should not be modified between logical resets.
-    uint32_t instr_count, instr_count_h;
+    uint64_t instr_count;
     // instruction execution state. if not NONE, then instruction execution
     // can't continue and core_step() exits
     core_error_t error;

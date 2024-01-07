@@ -340,7 +340,7 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
                 reads should return the value before the increment, and writes should
                 set the value after the increment. but we don't expose any way to write
                 the counters, so I don't think it'll cause visible issues */ \
-                *value = (addr & (1 << 7)) ? core->instr_count_h : core->instr_count; \
+                *value = core->instr_count >> ((addr & (1 << 7)) ? 32 : 0); \
             return; \
         } \
     ) \
@@ -567,7 +567,6 @@ void core_step(core_t* core) {
 
     core->pc += 4;
     core->instr_count++;
-    if (!core->instr_count) core->instr_count_h++;
 
     uint32_t instr_opcode = instr & MASK(7);
     uint32_t value;
