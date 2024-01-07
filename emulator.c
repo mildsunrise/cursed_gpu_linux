@@ -12,6 +12,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sys/eventfd.h>
+#include <stdatomic.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <sys/uio.h>
@@ -33,6 +36,66 @@
 #define RAM_SIZE (512 * 1024 * 1024)
 
 #define TAP_INTERFACE "tap0"
+
+
+// SPSC circular queue, with separate write/commit steps
+
+typedef struct {
+    // the write head (atomic + local writer copy)
+    _Atomic uint8_t write_head_at;
+    uint8_t write_head;
+    // the read head (local reader)
+    uint8_t read_head;
+    // an eventfd (written to by writer, after each commit to the atomic)
+    int eventfd;
+    // elements buffer (shared)
+    uint8_t buffer [16];
+} spsc_queue_t;
+
+void spsc_queue_init(spsc_queue_t *queue) {
+    memset(queue, 0, sizeof(*queue));
+    queue->eventfd = eventfd(0, 0);
+    assert(queue->eventfd >= 0);
+    atomic_init(&queue->write_head_at, 0);
+    assert(atomic_is_lock_free(&queue->write_head_at));
+}
+
+// writes an item to the queue
+//
+// warning: there are NO CHECKS for overflows, caller is responsible
+// to make sure not to write more elements than queue capacity
+// (sizeof(queue->buffer) / sizeof(*queue->buffer) - 1)
+void spsc_queue_write(spsc_queue_t *queue, uint8_t value) {
+    queue->buffer[queue->write_head] = value;
+    queue->write_head++;
+    if (queue->write_head == sizeof(queue->buffer) / sizeof(*queue->buffer))
+        queue->write_head = 0;
+}
+
+// makes the written items visible to the reader end
+void spsc_queue_commit(spsc_queue_t *queue) {
+    atomic_store_explicit(&queue->write_head_at, queue->write_head, memory_order_release);
+
+    uint64_t wake_value = 1;
+    int ret = write(queue->eventfd, &wake_value, sizeof(wake_value));
+    assert(ret == sizeof(wake_value));
+}
+
+// reads all pending items from the queue, returning true if there were items to read
+bool spsc_queue_read_all(spsc_queue_t *queue, void (*cb)(uint8_t value, void *cookie), void *cookie) {
+    uint8_t head = atomic_load_explicit(&queue->write_head_at, memory_order_relaxed);
+    if (likely(queue->read_head == head))
+        return false;
+    atomic_thread_fence(memory_order_acquire);
+
+    while (queue->read_head != head) {
+        cb(queue->buffer[queue->read_head], cookie);
+        queue->read_head++;
+        if (queue->read_head == sizeof(queue->buffer) / sizeof(*queue->buffer))
+            queue->read_head = 0;
+    }
+    return true;
+}
 
 
 // main memory handlers (address must be relative, assumes it's within bounds)
@@ -94,6 +157,8 @@ typedef struct {
     // I/O handling
     int in_fd, out_fd;
     bool in_ready;
+    void (*need_more_data)(void *cookie);
+    void *cookie;
 } u8250_state_t;
 
 void u8250_update_interrupts(u8250_state_t *uart) {
@@ -108,13 +173,6 @@ void u8250_update_interrupts(u8250_state_t *uart) {
     }
 }
 
-void u8250_check_ready(u8250_state_t* uart) {
-    if (uart->in_ready) return; // no need to check
-    struct pollfd pfd = { uart->in_fd, POLLIN, 0 };
-    poll(&pfd, 1, 0);
-    if (pfd.revents & POLLIN) uart->in_ready = true;
-}
-
 void u8250_handle_out(u8250_state_t* uart, uint8_t value) {
     if (write(uart->out_fd, &value, 1) < 1)
         fprintf(stderr, "failed to write UART output: %s\n", strerror(errno));
@@ -122,12 +180,16 @@ void u8250_handle_out(u8250_state_t* uart, uint8_t value) {
 
 uint8_t u8250_handle_in(u8250_state_t* uart) {
     uint8_t value = 0;
-    u8250_check_ready(uart);
     if (!uart->in_ready) return value;
     if (read(uart->in_fd, &value, 1) < 0)
         fprintf(stderr, "failed to read UART input: %s\n", strerror(errno));
-    uart->in_ready = false;
-    u8250_check_ready(uart);
+
+    struct pollfd pfd = { uart->in_fd, POLLIN, 0 };
+    poll(&pfd, 1, 0);
+    if (!(pfd.revents & POLLIN)) {
+        uart->in_ready = false;
+        uart->need_more_data(uart->cookie);
+    }
     return value;
 }
 
@@ -221,6 +283,8 @@ typedef struct {
     // supplied by environment
     int tap_fd;
     uint32_t* ram;
+    void (*need_more_data)(int queue_idx, void *cookie);
+    void *cookie;
 } virtionet_state_t;
 
 #define __VNET_FEATURES_0 0
@@ -240,11 +304,14 @@ void virtionet_set_fail(virtionet_state_t* vnet) {
 void virtionet_update_status(virtionet_state_t* vnet, uint32_t status) {
     vnet->Status |= status;
     if (!status) { // reset
-        int tap_fd = vnet->tap_fd;
-        uint32_t* ram = vnet->ram;
+        virtionet_state_t old_vnet = *vnet;
         memset(vnet, 0, sizeof(*vnet));
-        vnet->tap_fd = tap_fd;
-        vnet->ram = ram;
+        vnet->tap_fd = old_vnet.tap_fd;
+        vnet->ram = old_vnet.ram;
+        vnet->need_more_data = old_vnet.need_more_data;
+        vnet->cookie = old_vnet.cookie;
+        vnet->queues[0].fd_ready = old_vnet.queues[0].fd_ready;
+        vnet->queues[1].fd_ready = old_vnet.queues[1].fd_ready;
     }
     fprintf(stderr, "[VNET] status: %s\n", virtio_status_to_string(vnet->Status));
 }
@@ -316,10 +383,9 @@ bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t 
     void __virtionet_try_##NAME_SUFFIX(virtionet_state_t* vnet) { \
         uint32_t* ram = vnet->ram; \
         virtionet_queue_t* queue = &vnet->queues[QUEUE_IDX]; \
-        if ((vnet->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) || !queue->fd_ready) \
+        if (!(vnet->Status & VIRTIO_STATUS__DRIVER_OK) || (vnet->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) || !queue->fd_ready) \
             return; \
-        if (!( (vnet->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready )) \
-            return virtionet_set_fail(vnet); \
+        if (!queue->ready) return virtionet_set_fail(vnet); \
         \
         /* check for new buffers */ \
         uint16_t new_avail = ram[queue->QueueAvail] >> 16; \
@@ -347,6 +413,7 @@ bool __vnet_iovec_read(struct iovec** vecs, size_t* nvecs, uint8_t* dst, size_t 
             ssize_t plen = VERB##v(vnet->tap_fd, buffer_iovs_cursor, buffer_niovs); \
             if (plen < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) { \
                 queue->fd_ready = false; \
+                vnet->need_more_data(QUEUE_IDX, vnet->cookie); \
                 break; \
             } \
             if (plen < 0) { \
@@ -376,17 +443,6 @@ void virtionet_notify_queue(virtionet_state_t* vnet, uint32_t queueIdx) {
         case __VNET_QUEUE_RX: return __virtionet_try_rx(vnet);
         case __VNET_QUEUE_TX: return __virtionet_try_tx(vnet);
     }
-}
-
-void virtionet_refresh_queue(virtionet_state_t* vnet) {
-    if (!(vnet->Status & VIRTIO_STATUS__DRIVER_OK) || (vnet->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
-        return;
-    struct pollfd pfd = { vnet->tap_fd, POLLIN | POLLOUT, 0 };
-    poll(&pfd, 1, 0);
-    if (pfd.revents & POLLIN)
-        vnet->queues[__VNET_QUEUE_RX].fd_ready = true, __virtionet_try_rx(vnet);
-    if (pfd.revents & POLLOUT)
-        vnet->queues[__VNET_QUEUE_TX].fd_ready = true, __virtionet_try_tx(vnet);
 }
 
 #define __virtionet_body(R, W) \
@@ -432,8 +488,6 @@ void virtionet_refresh_queue(virtionet_state_t* vnet) {
             W( \
                 if (value & 1) \
                     __VNET_QUEUE.last_avail = vnet->ram[__VNET_QUEUE.QueueAvail] >> 16; \
-                if (vnet->QueueSel == __VNET_QUEUE_RX) \
-                    vnet->ram[__VNET_QUEUE.QueueUsed] |= 1; /* set VIRTQ_USED_F_NO_NOTIFY */ \
             ) \
             return true; \
         W(case 32: /* QueueDescLow (W) */ \
@@ -462,6 +516,8 @@ void virtionet_refresh_queue(virtionet_state_t* vnet) {
         case 28: /* Status (RW) */ \
             R(*value = vnet->Status;) \
             W(virtionet_update_status(vnet, value);) \
+            W(__virtionet_try_rx(vnet);) \
+            W(__virtionet_try_tx(vnet);) \
             return true; \
         \
         R(case 63: /* ConfigGeneration (R) */ \
@@ -881,7 +937,7 @@ void virtiogpu_notify_queue(virtiogpu_state_t* vgpu, uint32_t queueIdx) {
 
 void virtiogpu_cb_write_fence(void *cookie, uint32_t fence) {
     virtiogpu_state_t* vgpu = (virtiogpu_state_t*) cookie;
-    if ((vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
+    if (!(vgpu->Status & VIRTIO_STATUS__DRIVER_OK) || (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
         return;
 
     uint32_t QUEUE_IDX = __VGPU_QUEUE_CONTROL;
@@ -912,12 +968,6 @@ void virtiogpu_cb_write_fence(void *cookie, uint32_t fence) {
     /* send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */
     if (!(ram[queue->QueueAvail] & 1))
         vgpu->InterruptStatus |= VIRTIO_INT__USED_RING;
-}
-
-void virtiogpu_refresh_queue(virtiogpu_state_t* vgpu) {
-    if (!(vgpu->Status & VIRTIO_STATUS__DRIVER_OK) || (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
-        return;
-    virgl_renderer_poll();
 }
 
 #define __virtiogpu_body(R, W) \
@@ -1125,6 +1175,15 @@ REG_FUNCTIONS(void plic_wrap_mem, (core_t *core, plic_state_t *plic, uint32_t ad
 #define IRQ_VGPU 3
 #define IRQ_VGPU_BIT (1 << IRQ_VGPU)
 
+// keep queue capacity over number of items here
+typedef enum {
+    IO_EVENT_STOP = 0,
+    IO_EVENT_UART_RX,
+    IO_EVENT_VNET_RX,
+    IO_EVENT_VNET_TX,
+    IO_EVENT_VGPU,
+} io_event_t;
+
 typedef struct {
     bool stopped;
     uint32_t *ram;
@@ -1132,7 +1191,19 @@ typedef struct {
     u8250_state_t uart;
     virtionet_state_t vnet;
     virtiogpu_state_t gpu;
+    int virglrenderer_fd;
     uint64_t timer;
+
+    // these queues are used for communication between the I/O and main
+    // threads. when I/O gets a poll condition on one of the FDs, it writes
+    // the corresponding event ID into the io2main queue and removes it from
+    // subsequent polls. when main has handled that poll condition and wants
+    // polls to include it again, it writes the event ID back into the
+    // main2io queue. the special event ID 0 is a stop condition, it is sent
+    // by main telling I/O thread loop to exit, or by I/O thread indicating
+    // it has found an irrecoverable error and exited.
+    spsc_queue_t io2main;
+    spsc_queue_t main2io;
 } emu_state_t;
 
 // we define fetch separately because it's much simpler (width is fixed,
@@ -1277,6 +1348,75 @@ void handle_sbi_ecall(core_t* core) {
 }
 
 
+// I/O thread
+
+typedef struct {
+    struct pollfd *pfd;
+    bool stop_requested;
+} io_thread_handler_data_t;
+
+static void io_thread_handler(uint8_t event, void *__arg);
+
+#define __IO_THREAD_HANDLE_EVENT(n, poll_event, event_id) \
+    if (pfd[n].revents & poll_event) { \
+        spsc_queue_write(&data->io2main, event_id); \
+        spsc_queue_commit(&data->io2main); \
+        pfd[n].events &= ~poll_event; \
+    }
+
+#define __IO_THREAD_EVENTS(macro) \
+    macro(1, POLLIN, IO_EVENT_UART_RX) \
+    macro(2, POLLIN, IO_EVENT_VNET_RX) \
+    macro(2, POLLOUT, IO_EVENT_VNET_TX) \
+    macro(3, POLLIN, IO_EVENT_VGPU) \
+    //
+
+void *io_thread(void *__arg) {
+    emu_state_t *data = (emu_state_t *) __arg;
+    struct pollfd pfd [] = {
+        { data->main2io.eventfd, POLLIN, 0 },
+        { data->uart.in_fd, POLLIN, 0 },
+        { data->vnet.tap_fd, POLLIN | POLLOUT, 0 },
+        { data->virglrenderer_fd, POLLIN, 0 },
+    };
+
+    while (1) {
+        int ret = poll(pfd, sizeof(pfd) / sizeof(*pfd), -1);
+        assert(ret > 0);
+
+        if (pfd[0].revents & POLLIN) {
+            uint64_t wake_value;
+            ret = read(data->main2io.eventfd, &wake_value, sizeof(wake_value));
+            assert(ret == 8);
+            io_thread_handler_data_t hdata = { pfd, false };
+            spsc_queue_read_all(&data->main2io, io_thread_handler, &hdata);
+            if (hdata.stop_requested)
+                break;
+        }
+
+        __IO_THREAD_EVENTS(__IO_THREAD_HANDLE_EVENT)
+    }
+    return NULL;
+}
+
+#define __IO_THREAD_HANDLE_EVENT_BACK(n, poll_event, event_id) \
+    case event_id: \
+        hdata->pfd[n].events |= poll_event; \
+        break;
+
+void io_thread_handler(uint8_t event, void *__arg) {
+    io_thread_handler_data_t *hdata = (io_thread_handler_data_t *) __arg;
+    switch (event) {
+        case IO_EVENT_STOP:
+            hdata->stop_requested = true;
+            break;
+        __IO_THREAD_EVENTS(__IO_THREAD_HANDLE_EVENT_BACK)
+        default:
+            abort();
+    }
+}
+
+
 // main emulation
 
 void read_file_into_ram(char** ram_cursor, const char* name) {
@@ -1293,7 +1433,54 @@ void read_file_into_ram(char** ram_cursor, const char* name) {
     fclose(input_file);
 }
 
+void main_io_handler(uint8_t event, void *__arg) {
+    core_t *core = (core_t *) __arg;
+    emu_state_t *data = (emu_state_t *) core->user_data;
+    switch (event) {
+        case IO_EVENT_UART_RX:
+            data->uart.in_ready = true;
+            emulator_update_uart_interrupts(core);
+            break;
+        case IO_EVENT_VNET_RX:
+            data->vnet.queues[__VNET_QUEUE_RX].fd_ready = true;
+            __virtionet_try_rx(&data->vnet);
+            emulator_update_vnet_interrupts(core);
+            break;
+        case IO_EVENT_VNET_TX:
+            data->vnet.queues[__VNET_QUEUE_TX].fd_ready = true;
+            __virtionet_try_tx(&data->vnet);
+            emulator_update_vnet_interrupts(core);
+            break;
+        case IO_EVENT_VGPU:
+            virgl_renderer_poll();
+            spsc_queue_write(&data->main2io, IO_EVENT_VGPU);
+            spsc_queue_commit(&data->main2io);
+            if (data->gpu.InterruptStatus)
+                emulator_update_vgpu_interrupts(core);
+            break;
+        default:
+            abort();
+    }
+}
+
+void uart_need_more_data(void *__arg) {
+    emu_state_t *data = (emu_state_t *) __arg;
+    spsc_queue_write(&data->main2io, IO_EVENT_UART_RX);
+    spsc_queue_commit(&data->main2io);
+}
+
+void vnet_need_more_data(int queue_idx, void *__arg) {
+    emu_state_t *data = (emu_state_t *) __arg;
+    spsc_queue_write(&data->main2io,
+        queue_idx == __VNET_QUEUE_RX ? IO_EVENT_VNET_RX :
+        queue_idx == __VNET_QUEUE_TX ? IO_EVENT_VNET_TX :
+        (abort(), 0));
+    spsc_queue_commit(&data->main2io);
+}
+
 int main() {
+    int ret;
+
     // initialize emulator
     emu_state_t data;
     memset(&data, 0, sizeof(data));
@@ -1329,6 +1516,8 @@ int main() {
 
     data.uart.in_fd = 0;
     data.uart.out_fd = 1;
+    data.uart.need_more_data = uart_need_more_data;
+    data.uart.cookie = &data;
 
     data.vnet.tap_fd = open("/dev/net/tun", O_RDWR);
     if (data.vnet.tap_fd < 0) {
@@ -1347,17 +1536,32 @@ int main() {
     fprintf(stderr, "allocated TAP interface: %s\n", ifreq.ifr_name);
     assert(fcntl(data.vnet.tap_fd, F_SETFL, fcntl(data.vnet.tap_fd, F_GETFL, 0) | O_NONBLOCK) >= 0);
     data.vnet.ram = data.ram;
+    data.vnet.need_more_data = vnet_need_more_data;
+    data.vnet.cookie = &data;
 
-    int virgl_flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS /* | VIRGL_RENDERER_USE_EXTERNAL_BLOB */;
+    int virgl_flags = VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS /* | VIRGL_RENDERER_USE_EXTERNAL_BLOB */;
     struct virgl_renderer_callbacks virgl_cbs;
     memset(&virgl_cbs, 0, sizeof(virgl_cbs));
     virgl_cbs.version = VIRGL_RENDERER_CALLBACKS_VERSION;
     virgl_cbs.write_fence = virtiogpu_cb_write_fence;
-    if (virgl_renderer_init(&data.gpu, virgl_flags, &virgl_cbs)) {
+    if ((ret = virgl_renderer_init(&data.gpu, virgl_flags, &virgl_cbs))) {
         fprintf(stderr, "failed to initialize virgl renderer\n");
         return 2;
     }
     data.gpu.ram = data.ram;
+    if ((data.virglrenderer_fd = virgl_renderer_get_poll_fd()) < 0) {
+        fprintf(stderr, "virgl renderer thread sync not enabled\n");
+        return 2;
+    }
+
+    // start I/O thread
+    spsc_queue_init(&data.io2main);
+    spsc_queue_init(&data.main2io);
+    pthread_t io_thread_id;
+    if ((ret = pthread_create(&io_thread_id, NULL, io_thread, &data))) {
+        fprintf(stderr, "failed to spawn I/O thread: %s\n", strerror(ret));
+        return 2;
+    }
 
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);
@@ -1374,18 +1578,7 @@ int main() {
 
         if (peripheral_update_ctr-- == 0) {
             peripheral_update_ctr = 64;
-
-            u8250_check_ready(&data.uart);
-            if (data.uart.in_ready)
-                emulator_update_uart_interrupts(&core);
-
-            virtionet_refresh_queue(&data.vnet);
-            if (data.vnet.InterruptStatus)
-                emulator_update_vnet_interrupts(&core);
-
-            virtiogpu_refresh_queue(&data.gpu);
-            if (data.gpu.InterruptStatus)
-                emulator_update_vgpu_interrupts(&core);
+            spsc_queue_read_all(&data.io2main, main_io_handler, &core);
         }
 
         (core.instr_count > data.timer) ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
@@ -1422,4 +1615,12 @@ int main() {
         ((double)host_instr_count) / ((double)core.instr_count),
         ((double)host_cycle_count) / ((double)core.instr_count),
         core.instr_count / (double)elapsed * 1e3);
+
+    // stop I/O thread
+    spsc_queue_write(&data.main2io, IO_EVENT_STOP);
+    spsc_queue_commit(&data.main2io);
+    if ((ret = pthread_join(io_thread_id, NULL))) {
+        fprintf(stderr, "failed to join I/O thread: %s\n", strerror(ret));
+        return 2;
+    }
 }
