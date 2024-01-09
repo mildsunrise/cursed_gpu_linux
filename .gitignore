@@ -3,6 +3,7 @@
 # toolchain
 /riscv
 
+*.o
 /core_test
 /emulator
 /linux_dtb

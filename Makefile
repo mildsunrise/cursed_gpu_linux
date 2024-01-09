@@ -2,10 +2,29 @@ all: linux_dtb emulator
 
 # emulator
 
+DT_CFLAGS =
+CFLAGS = -flto -O3 -g -Wall -Wextra
+LDFLAGS =
+
+# use VirGL Renderer to expose a VGPU
+DT_CFLAGS += -DUSE_VIRGLRENDERER
+CFLAGS += -Ivirglrenderer/src
+LDFLAGS += -Lvirglrenderer/build/src -lvirglrenderer
+
+CFLAGS += $(DT_CFLAGS)
+
+core.o: core.c core.h riscv_constants.h
+	gcc $(CFLAGS) -c $< -o $@
+emulator.o: emulator.c core.h measure.c reg_macros.h riscv_constants.h virtio_constants.h
+	gcc $(CFLAGS) -c $< -o $@
+emulator: core.o emulator.o
+	gcc $(CFLAGS) $^ $(LDFLAGS) -o $@
+
 core_test: core.c core.h test.c measure.c reg_macros.h riscv_constants.h
-	gcc -flto -O3 -g -Wall -Wextra core.c test.c -o $@
-emulator: core.c core.h emulator.c measure.c reg_macros.h riscv_constants.h virtio_constants.h
-	gcc -flto -O3 -g -Wall -Wextra -Ivirglrenderer/src core.c emulator.c -Lvirglrenderer/build/src -lvirglrenderer -o $@
+	gcc $(CFLAGS) core.c test.c -o $@
+
+clean:
+	rm -f *.o linux_dtb{,.*} emulator core_test
 
 # kernel
 
@@ -40,7 +59,7 @@ DTC_INCLUDE=$(LINUX_DIR)/scripts/dtc/include-prefixes $(LINUX_DIR)/arch/riscv/bo
 
 linux_dtb: linux_dts $(LINUX_DTC)
 	cc -E -Wp,-MMD,$@.dep.cpp -undef -D__DTS__ -nostdinc -x assembler-with-cpp \
-		$(addprefix -I,$(DTC_INCLUDE)) \
+		$(addprefix -I,$(DTC_INCLUDE)) $(DT_CFLAGS) \
 		-o $@.tmp $<
 	$(LINUX_DTC) -b 0 \
 		$(addprefix -i,$(DTC_INCLUDE)) \

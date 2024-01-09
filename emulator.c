@@ -18,8 +18,11 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <sys/uio.h>
-#include <virglrenderer.h>
 #include "measure.c"
+
+#ifdef USE_VIRGLRENDERER
+#include <virglrenderer.h>
+#endif
 
 #define MASK(n) (~((~0U << (n))))
 #define unlikely(x) __builtin_expect((x),0)
@@ -552,6 +555,8 @@ REG_FUNCTIONS(void virtionet_wrap_mem, (core_t *core, virtionet_state_t *vnet, u
 
 
 // VIRTIO-GPU
+
+#if USE_VIRGLRENDERER
 
 // the protocols we offer
 static const uint32_t __VGPU_CAPSETS [] = {
@@ -1091,6 +1096,8 @@ REG_FUNCTIONS(bool virtiogpu_reg, (virtiogpu_state_t *vgpu, uint32_t addr), uint
 
 REG_FUNCTIONS(void virtiogpu_wrap_mem, (core_t *core, virtiogpu_state_t *vgpu, uint32_t addr, uint8_t width), uint32_t, __virtiogpu_wrap_body)
 
+#endif
+
 
 // PLIC
 // we want it to be simple so: 32 interrupts, no priority
@@ -1190,7 +1197,9 @@ typedef struct {
     plic_state_t plic;
     u8250_state_t uart;
     virtionet_state_t vnet;
+#ifdef USE_VIRGLRENDERER
     virtiogpu_state_t gpu;
+#endif
     int virglrenderer_fd;
     uint64_t timer;
 
@@ -1239,11 +1248,22 @@ void emulator_update_vnet_interrupts(core_t* core) {
     plic_update_interrupts(core, &data->plic);
 }
 
+#ifdef USE_VIRGLRENDERER
 void emulator_update_vgpu_interrupts(core_t* core) {
     emu_state_t *data = (emu_state_t *)core->user_data;
     data->gpu.InterruptStatus ? (data->plic.active |= IRQ_VGPU_BIT) : (data->plic.active &= ~IRQ_VGPU_BIT);
     plic_update_interrupts(core, &data->plic);
 }
+
+#define __VGPU_MEM_BODY(R, W) \
+            case 0x42: /* VIRTIO-GPU */ \
+                REG_FUNC(R, W, virtiogpu_wrap_mem)(core, &data->gpu, addr & 0xFFFFF, width, value); \
+                virgl_renderer_poll(); \
+                emulator_update_vgpu_interrupts(core); \
+                return;
+#else
+#define __VGPU_MEM_BODY(R, W)
+#endif
 
 #define __mem_body(R, W) \
     emu_state_t *data = (emu_state_t *)core->user_data; \
@@ -1267,10 +1287,7 @@ void emulator_update_vgpu_interrupts(core_t* core) {
                 REG_FUNC(R, W, virtionet_wrap_mem)(core, &data->vnet, addr & 0xFFFFF, width, value); \
                 emulator_update_vnet_interrupts(core); \
                 return; \
-            case 0x42: /* VIRTIO-GPU */ \
-                REG_FUNC(R, W, virtiogpu_wrap_mem)(core, &data->gpu, addr & 0xFFFFF, width, value); \
-                emulator_update_vgpu_interrupts(core); \
-                return; \
+            __VGPU_MEM_BODY(R, W) \
         } \
     } \
     core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val);
@@ -1451,6 +1468,7 @@ void main_io_handler(uint8_t event, void *__arg) {
             __virtionet_try_tx(&data->vnet);
             emulator_update_vnet_interrupts(core);
             break;
+#ifdef USE_VIRGLRENDERER
         case IO_EVENT_VGPU:
             virgl_renderer_poll();
             spsc_queue_write(&data->main2io, IO_EVENT_VGPU);
@@ -1458,6 +1476,7 @@ void main_io_handler(uint8_t event, void *__arg) {
             if (data->gpu.InterruptStatus)
                 emulator_update_vgpu_interrupts(core);
             break;
+#endif
         default:
             abort();
     }
@@ -1539,6 +1558,8 @@ int main() {
     data.vnet.need_more_data = vnet_need_more_data;
     data.vnet.cookie = &data;
 
+    data.virglrenderer_fd = -1;
+#ifdef USE_VIRGLRENDERER
     int virgl_flags = VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS /* | VIRGL_RENDERER_USE_EXTERNAL_BLOB */;
     struct virgl_renderer_callbacks virgl_cbs;
     memset(&virgl_cbs, 0, sizeof(virgl_cbs));
@@ -1553,6 +1574,7 @@ int main() {
         fprintf(stderr, "virgl renderer thread sync not enabled\n");
         return 2;
     }
+#endif
 
     // start I/O thread
     spsc_queue_init(&data.io2main);
