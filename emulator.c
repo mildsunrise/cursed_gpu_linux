@@ -5,6 +5,7 @@
 #include "virtio_constants.h"
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h>
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1216,7 +1217,9 @@ typedef struct {
     virtiogpu_state_t gpu;
 #endif
     int virglrenderer_fd;
+    uint64_t time;
     uint64_t timer;
+    int timer_fd;
 
     // these queues are used for communication between the I/O and main
     // threads. when I/O gets a poll condition on one of the FDs, it writes
@@ -1533,6 +1536,48 @@ void vnet_need_more_data(int queue_idx, void *__arg) {
     spsc_queue_commit(&data->main2io);
 }
 
+static uint64_t read_time(core_t* core) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+    return data->time;
+}
+
+static void wfi(core_t* core) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+
+    struct timespec start;
+    __checkerrno(clock_gettime(CLOCK_MONOTONIC, &start), "clock_gettime");
+
+    struct pollfd pfd [] = {
+        { data->io2main.eventfd, POLLIN, 0 },
+        { data->timer_fd, 0, 0 },
+    };
+
+    if (data->time < data->timer) {
+        int64_t ticks = data->timer - data->time;
+        ticks = (ticks * 1000000000) / CLOCK_FREQ;
+        struct itimerspec spec = { { 0, 0 }, { ticks/1000000000, ticks%1000000000 } };
+        __checkerrno(timerfd_settime(data->timer_fd, 0, &spec, NULL), "timerfd_settime");
+        pfd[1].events |= POLLIN;
+    }
+
+    while (!(core->sip & core->sie)) {
+        __checkerrno(poll(pfd, sizeof(pfd) / sizeof(*pfd), -1) < 0, "WFI poll");
+        if (pfd[0].revents & POLLIN) {
+            read_eventfd(pfd[0].fd);
+            spsc_queue_read_all(&data->io2main, main_io_handler, core);
+        }
+        if (pfd[1].revents & POLLIN) {
+            core->sip |= RISCV_INT_STI_BIT;
+            pfd[1].events &= ~POLLIN;
+        }
+    }
+
+    struct timespec end;
+    __checkerrno(clock_gettime(CLOCK_MONOTONIC, &end), "clock_gettime");
+    int64_t ticks = (end.tv_sec - start.tv_sec) * 1000000000 + (end.tv_nsec - start.tv_nsec);
+    data->time += (ticks * CLOCK_FREQ) / 1000000000;
+}
+
 int main() {
     int ret;
 
@@ -1546,6 +1591,8 @@ int main() {
     core.mem_load = mem_read;
     core.mem_store = mem_write;
     core.mem_page_table = mem_page_table;
+    core.read_time = read_time;
+    core.wfi = wfi;
 
     // set up RAM
     int ramfd = memfd_create("guest_ram", 0);
@@ -1568,6 +1615,9 @@ int main() {
     core.x_regs[RISCV_R_A1] = dtb_addr;
 
     // set up peripherals
+
+    data.timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    __checkerrno(data.timer_fd < 0, "timerfd_create");
 
     data.uart.in_fd = 0;
     data.uart.out_fd = 1;
@@ -1630,7 +1680,7 @@ int main() {
             spsc_queue_read_all(&data.io2main, main_io_handler, &core);
         }
 
-        (core.instr_count > data.timer) ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
+        (data.time++ > data.timer) ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
 
         core_step(&core);
         if (likely(!core.error)) continue;

@@ -305,7 +305,7 @@ void __core_do_privileged(core_t* core, uint32_t instr) {
         case RISCV_PRIV_SRET:
             __core_do_sret(core); break;
         case RISCV_PRIV_WFI:
-            break; // FIXME
+            core->wfi(core); break;
         default:
             core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); break;
     }
@@ -336,11 +336,11 @@ void __core_set_dest(core_t* core, uint32_t instr, uint32_t x);
             if (idx >= 0x20 || !( core->s_mode || ((core->scounteren >> idx) & 1) )) \
                 core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
             else \
-                /* we'll use the instruction counter for all of the counters. ideally,
+                /* we'll use the instruction counter for cycle/performance counters too. ideally,
                 reads should return the value before the increment, and writes should
                 set the value after the increment. but we don't expose any way to write
                 the counters, so I don't think it'll cause visible issues */ \
-                *value = core->instr_count >> ((addr & (1 << 7)) ? 32 : 0); \
+                *value = ((addr & 0x7F) == 1 ? core->read_time(core) : core->instr_count) >> ((addr & (1 << 7)) ? 32 : 0); \
             return; \
         } \
     ) \

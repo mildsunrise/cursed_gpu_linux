@@ -2,7 +2,7 @@ all: linux_dtb emulator
 
 # emulator
 
-DT_CFLAGS =
+DT_CFLAGS = -DCLOCK_FREQ=45000000
 CFLAGS = -flto -O3 -g -Wall -Wextra
 LDFLAGS =
 

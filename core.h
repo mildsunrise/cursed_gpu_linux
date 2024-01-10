@@ -71,7 +71,7 @@ struct _core_t {
     // address of last instruction that began execution
     uint32_t current_pc;
     // 'instructions executed' 64-bit counter. currently used
-    // as "real-time clock", instruction-retired counter, and cycle counter.
+    // as instruction-retired counter and cycle counter.
     // should not be modified between logical resets.
     uint64_t instr_count;
     // instruction execution state. if not NONE, then instruction execution
@@ -111,6 +111,9 @@ struct _core_t {
     // pre-validates that the required page number can hold a page table,
     // and returns a uint32_t* to said page. if not valid, return NULL
     uint32_t* (*mem_page_table)(const core_t* core, uint32_t ppn);
+    // time / sleep
+    uint64_t (*read_time)(core_t* core);
+    void (*wfi)(core_t* core);
 };
 
 // initialize the core structure. zeroes user-supplied fields too.
