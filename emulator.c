@@ -41,6 +41,20 @@
 #define TAP_INTERFACE "tap0"
 
 
+inline uint64_t read_eventfd(int fd) {
+    uint64_t value;
+    int ret = read(fd, &value, sizeof(value));
+    assert(ret == 8);
+    return ret;
+}
+
+#define __checkerrno(expr, fmt, ...) \
+    if (expr) { \
+        fprintf(stderr, fmt " failed: %s\n", __VA_ARGS__ __VA_OPT__(,) strerror(errno)); \
+        exit(2); \
+    }
+
+
 // SPSC circular queue, with separate write/commit steps
 
 typedef struct {
@@ -1398,13 +1412,10 @@ void *io_thread(void *__arg) {
     };
 
     while (1) {
-        int ret = poll(pfd, sizeof(pfd) / sizeof(*pfd), -1);
-        assert(ret > 0);
+        __checkerrno(poll(pfd, sizeof(pfd) / sizeof(*pfd), -1) < 0, "I/O poll");
 
         if (pfd[0].revents & POLLIN) {
-            uint64_t wake_value;
-            ret = read(data->main2io.eventfd, &wake_value, sizeof(wake_value));
-            assert(ret == 8);
+            read_eventfd(pfd[0].fd);
             io_thread_handler_data_t hdata = { pfd, false };
             spsc_queue_read_all(&data->main2io, io_thread_handler, &hdata);
             if (hdata.stop_requested)
@@ -1436,18 +1447,22 @@ void io_thread_handler(uint8_t event, void *__arg) {
 
 // main emulation
 
+#define __checkerrno_file(expr, callname) \
+    __checkerrno(expr, callname " \"%s\"", name)
+
 void read_file_into_ram(char** ram_cursor, const char* name) {
-    FILE *input_file = fopen(name, "r");
-    if (!input_file) {
-        fprintf(stderr, "could not open %s\n", name);
-        exit(2);
-    }
     // FIXME: map instead of reading
-    while (!feof(input_file)) {
-        *ram_cursor += fread(*ram_cursor, sizeof(char), 1024 * 1024, input_file);
-        assert(!ferror(input_file));
+    int fd = open(name, O_RDONLY);
+    __checkerrno_file(fd < 0, "open");
+
+    while (true) {
+        int ret = read(fd, *ram_cursor, 1024 * 1024);
+        __checkerrno_file(ret < 0, "read");
+        *ram_cursor += ret;
+        if (ret == 0) break;
     }
-    fclose(input_file);
+
+    __checkerrno_file(close(fd) < 0, "close");
 }
 
 void main_io_handler(uint8_t event, void *__arg) {
@@ -1513,10 +1528,7 @@ int main() {
 
     // set up RAM
     data.ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (data.ram == MAP_FAILED) {
-        fprintf(stderr, "Could not map RAM\n");
-        return 2;
-    }
+    __checkerrno(data.ram == MAP_FAILED, "mmap guest RAM");
     assert(!(((uintptr_t)data.ram) & 0b11));
 
     char* ram_cursor = (char*) data.ram;
@@ -1539,19 +1551,13 @@ int main() {
     data.uart.cookie = &data;
 
     data.vnet.tap_fd = open("/dev/net/tun", O_RDWR);
-    if (data.vnet.tap_fd < 0) {
-        fprintf(stderr, "failed to open TAP device: %s\n", strerror(errno));
-        return 2;
-    }
+    __checkerrno(data.vnet.tap_fd < 0, "open TAP device");
     struct ifreq ifreq;
     memset(&ifreq, 0, sizeof(ifreq));
     // iproute2 sets PI, let's make it easier for folks who want to use persistent taps
     ifreq.ifr_flags = IFF_TAP | IFF_NO_PI;
     strncpy(ifreq.ifr_name, TAP_INTERFACE, sizeof(ifreq.ifr_name));
-    if (ioctl(data.vnet.tap_fd, TUNSETIFF, &ifreq) < 0) {
-        fprintf(stderr, "failed to allocate TAP device: %s\n", strerror(errno));
-        return 2;
-    }
+    __checkerrno(ioctl(data.vnet.tap_fd, TUNSETIFF, &ifreq) < 0, "TUNSETIFF");
     fprintf(stderr, "allocated TAP interface: %s\n", ifreq.ifr_name);
     assert(fcntl(data.vnet.tap_fd, F_SETFL, fcntl(data.vnet.tap_fd, F_GETFL, 0) | O_NONBLOCK) >= 0);
     data.vnet.ram = data.ram;
@@ -1580,10 +1586,7 @@ int main() {
     spsc_queue_init(&data.io2main);
     spsc_queue_init(&data.main2io);
     pthread_t io_thread_id;
-    if ((ret = pthread_create(&io_thread_id, NULL, io_thread, &data))) {
-        fprintf(stderr, "failed to spawn I/O thread: %s\n", strerror(ret));
-        return 2;
-    }
+    __checkerrno((ret = pthread_create(&io_thread_id, NULL, io_thread, &data)), "spawn I/O thread");
 
     // emulate!
     int cycle_count_fd = simple_perf_counter(PERF_COUNT_HW_CPU_CYCLES);
@@ -1641,8 +1644,5 @@ int main() {
     // stop I/O thread
     spsc_queue_write(&data.main2io, IO_EVENT_STOP);
     spsc_queue_commit(&data.main2io);
-    if ((ret = pthread_join(io_thread_id, NULL))) {
-        fprintf(stderr, "failed to join I/O thread: %s\n", strerror(ret));
-        return 2;
-    }
+    __checkerrno((ret = pthread_join(io_thread_id, NULL)), "join I/O thread");
 }
