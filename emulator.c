@@ -11,6 +11,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/eventfd.h>
@@ -1451,7 +1452,6 @@ void io_thread_handler(uint8_t event, void *__arg) {
     __checkerrno(expr, callname " \"%s\"", name)
 
 void read_file_into_ram(char** ram_cursor, const char* name) {
-    // FIXME: map instead of reading
     int fd = open(name, O_RDONLY);
     __checkerrno_file(fd < 0, "open");
 
@@ -1461,6 +1461,27 @@ void read_file_into_ram(char** ram_cursor, const char* name) {
         *ram_cursor += ret;
         if (ret == 0) break;
     }
+
+    __checkerrno_file(close(fd) < 0, "close");
+}
+
+void map_file_into_ram(char** ram_cursor, const char* name) {
+    int fd = open(name, O_RDONLY);
+    __checkerrno_file(fd < 0, "open");
+
+    struct stat stat;
+    __checkerrno_file(fstat(fd, &stat) < 0, "fstat");
+    if (!S_ISREG(stat.st_mode)) {
+        fprintf(stderr, "error: %s is not a regular file\n", name);
+        exit(2);
+    }
+
+    int flags = MAP_FIXED | MAP_PRIVATE;
+    int prot = PROT_READ | PROT_WRITE;
+    void *new_cursor = mmap(*ram_cursor, stat.st_size, prot, flags, fd, 0);
+    __checkerrno_file(new_cursor == MAP_FAILED, "mmap");
+    assert(new_cursor == (*ram_cursor));
+    *ram_cursor += stat.st_size;
 
     __checkerrno_file(close(fd) < 0, "close");
 }
@@ -1527,12 +1548,15 @@ int main() {
     core.mem_page_table = mem_page_table;
 
     // set up RAM
-    data.ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    __checkerrno(data.ram == MAP_FAILED, "mmap guest RAM");
+    int ramfd = memfd_create("guest_ram", 0);
+    __checkerrno(ramfd < 0, "memfd_create");
+    __checkerrno(ftruncate(ramfd, RAM_SIZE), "memfd ftruncate");
+    data.ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, ramfd, 0);
+    __checkerrno(data.ram == MAP_FAILED, "mmaping guest ram");
     assert(!(((uintptr_t)data.ram) & 0b11));
 
     char* ram_cursor = (char*) data.ram;
-    read_file_into_ram(&ram_cursor, "linux/arch/riscv/boot/Image");
+    map_file_into_ram(&ram_cursor, "linux/arch/riscv/boot/Image");
     // load at last MB to prevent kernel / initrd from overwriting it
     uint32_t dtb_addr = RAM_SIZE - 1024 * 1024;
     ram_cursor = ((char*)data.ram) + dtb_addr;
