@@ -1217,7 +1217,7 @@ typedef struct {
     virtiogpu_state_t gpu;
 #endif
     int virglrenderer_fd;
-    uint64_t time;
+    uint64_t time_offset;
     uint64_t timer;
     int timer_fd;
 
@@ -1538,11 +1538,12 @@ void vnet_need_more_data(int queue_idx, void *__arg) {
 
 static uint64_t read_time(core_t* core) {
     emu_state_t *data = (emu_state_t *)core->user_data;
-    return data->time;
+    return data->time_offset + core->instr_count;
 }
 
 static void wfi(core_t* core) {
     emu_state_t *data = (emu_state_t *)core->user_data;
+    if (core->sip & core->sie) return;
 
     struct timespec start;
     __checkerrno(clock_gettime(CLOCK_MONOTONIC, &start), "clock_gettime");
@@ -1552,10 +1553,11 @@ static void wfi(core_t* core) {
         { data->timer_fd, 0, 0 },
     };
 
-    if (data->time < data->timer) {
-        int64_t ticks = data->timer - data->time;
-        ticks = (ticks * 1000000000) / CLOCK_FREQ;
-        struct itimerspec spec = { { 0, 0 }, { ticks/1000000000, ticks%1000000000 } };
+    uint64_t ticks = data->timer - core->instr_count;
+    if (core->sie & RISCV_INT_STI_BIT) {
+        if (core->instr_count >= data->timer) return;
+        uint64_t nsec = (ticks * 1000000000) / CLOCK_FREQ;
+        struct itimerspec spec = { { 0, 0 }, { nsec/1000000000, nsec%1000000000 } };
         __checkerrno(timerfd_settime(data->timer_fd, 0, &spec, NULL), "timerfd_settime");
         pfd[1].events |= POLLIN;
     }
@@ -1566,16 +1568,18 @@ static void wfi(core_t* core) {
             read_eventfd(pfd[0].fd);
             spsc_queue_read_all(&data->io2main, main_io_handler, core);
         }
-        if (pfd[1].revents & POLLIN) {
+        if (pfd[1].revents & POLLIN)
             core->sip |= RISCV_INT_STI_BIT;
-            pfd[1].events &= ~POLLIN;
-        }
     }
 
-    struct timespec end;
-    __checkerrno(clock_gettime(CLOCK_MONOTONIC, &end), "clock_gettime");
-    int64_t ticks = (end.tv_sec - start.tv_sec) * 1000000000 + (end.tv_nsec - start.tv_nsec);
-    data->time += (ticks * CLOCK_FREQ) / 1000000000;
+    if (!(pfd[1].revents & POLLIN)) {
+        struct timespec end;
+        __checkerrno(clock_gettime(CLOCK_MONOTONIC, &end), "clock_gettime");
+        ticks = (end.tv_sec - start.tv_sec) * 1000000000 + (end.tv_nsec - start.tv_nsec);
+        ticks = (ticks * CLOCK_FREQ) / 1000000000;
+    }
+    data->time_offset += ticks;
+    data->timer -= ticks;
 }
 
 int main() {
@@ -1680,7 +1684,7 @@ int main() {
             spsc_queue_read_all(&data.io2main, main_io_handler, &core);
         }
 
-        (data.time++ > data.timer) ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
+        (core.instr_count > data.timer) ? (core.sip |= RISCV_INT_STI_BIT) : (core.sip &= ~RISCV_INT_STI_BIT);
 
         core_step(&core);
         if (likely(!core.error)) continue;
