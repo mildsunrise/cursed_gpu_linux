@@ -24,6 +24,7 @@
 
 #ifdef USE_VIRGLRENDERER
 #include <virglrenderer.h>
+#include <virglrenderer_hw.h>
 #endif
 
 #define MASK(n) (~((~0U << (n))))
@@ -574,6 +575,9 @@ REG_FUNCTIONS(void virtionet_wrap_mem, (core_t *core, virtionet_state_t *vnet, u
 
 #if USE_VIRGLRENDERER
 
+// from <virglrenderer/src/gallium/include/pipe/p_defines.h>:
+#define PIPE_TEXTURE_2D 2
+
 // the protocols we offer
 static const uint32_t __VGPU_CAPSETS [] = {
    VIRTIO_GPU_CAPSET_VIRGL,
@@ -591,7 +595,6 @@ typedef struct {
     uint32_t QueueUsed;
     uint16_t last_avail;
     bool ready;
-    bool fd_ready;
 } virtiogpu_queue_t;
 
 typedef struct virtiogpu_request_list_t {
@@ -734,11 +737,13 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         return resp_len;
     }
 
+    // FRAMEBUFFER
+
     if (cmd->type == VIRTIO_GPU_CMD_GET_DISPLAY_INFO) {
         __vgpu_safe_cast(resp, struct virtio_gpu_resp_display_info);
         memset(resp, 0, sizeof(*resp));
         resp->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
-        resp->pmodes[0].enabled = 0;
+        resp->pmodes[0].enabled = 1;
         resp->pmodes[0].r.x = 0;
         resp->pmodes[0].r.y = 0;
         resp->pmodes[0].r.width = 800;
@@ -746,10 +751,30 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         return sizeof(*resp);
     }
 
+    if (cmd->type == VIRTIO_GPU_CMD_SET_SCANOUT) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_set_scanout);
+        fprintf(stderr, "res=%u, scan=%u, rect=%ux%u+%u,%u\n", cmd->resource_id, cmd->scanout_id, cmd->r.width, cmd->r.height, cmd->r.x, cmd->r.y); fflush(stderr);
+        resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+        // TODO
+        return sizeof(*resp);
+    }
+    if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_FLUSH) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_flush);
+        fprintf(stderr, "res=%u, rect=%ux%u+%u,%u\n", cmd->resource_id, cmd->r.width, cmd->r.height, cmd->r.x, cmd->r.y); fflush(stderr);
+        resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+        // TODO
+        return sizeof(*resp);
+    }
+
+    // CONTEXTS
+
     if (cmd->type == VIRTIO_GPU_CMD_CTX_CREATE) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_ctx_create);
         __vgpu_assert_cond(cmd->nlen < sizeof(cmd->debug_name), "debugging name does not fit");
-        __vgpu_check_ret(*resp, virgl_renderer_context_create_with_flags(cmd->hdr.ctx_id, cmd->context_init, cmd->nlen, cmd->debug_name));
+        __vgpu_check_ret(*resp,
+            !cmd->context_init ?
+                virgl_renderer_context_create(cmd->hdr.ctx_id, cmd->nlen, cmd->debug_name) :
+                virgl_renderer_context_create_with_flags(cmd->hdr.ctx_id, cmd->context_init, cmd->nlen, cmd->debug_name));
         return sizeof(*resp);
     }
 
@@ -768,9 +793,30 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         return sizeof(*resp);
     }
 
+    // RESOURCES
+
     if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_CREATE_3D) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_create_3d);
         __vgpu_check_ret(*resp, virgl_renderer_resource_create((struct virgl_renderer_resource_create_args *)&cmd->resource_id, NULL, 0));
+        return sizeof(*resp);
+    }
+
+    if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_CREATE_2D) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_create_2d);
+        struct virgl_renderer_resource_create_args args = {
+            .handle = cmd->resource_id,
+            .format = cmd->format,
+            .width = cmd->width,
+            .height = cmd->height,
+            .bind = VIRGL_BIND_SAMPLER_VIEW,
+            .target = PIPE_TEXTURE_2D,
+            .flags = 0, //VIRGL_RESOURCE_Y_0_TOP,
+            .depth = 1,
+            .array_size = 1,
+            .nr_samples = 1,
+            .last_level = 0,
+        };
+        __vgpu_check_ret(*resp, virgl_renderer_resource_create(&args, NULL, 0));
         return sizeof(*resp);
     }
 
@@ -819,6 +865,15 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         __vgpu_safe_cast(cmd, const struct virtio_gpu_ctx_resource);
         (cmd->hdr.type == VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE ? virgl_renderer_ctx_attach_resource : virgl_renderer_ctx_detach_resource)(cmd->hdr.ctx_id, cmd->resource_id);
         resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+        return sizeof(*resp);
+    }
+
+    // RESOURCE TRANSFERS
+
+    if (cmd->type == VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D) {
+        __vgpu_safe_cast(cmd, const struct virtio_gpu_transfer_to_host_2d);
+        struct virgl_box box = { cmd->r.x, cmd->r.y, 0, cmd->r.width, cmd->r.height, 1 };
+        __vgpu_check_ret(*resp, virgl_renderer_transfer_write_iov(cmd->resource_id, cmd->hdr.ctx_id, 0, 0, 0, &box, cmd->offset, NULL, 0));
         return sizeof(*resp);
     }
 
