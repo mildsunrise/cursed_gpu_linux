@@ -3,6 +3,7 @@
 #include "core.h"
 #include "reg_macros.h"
 #include "virtio_constants.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
@@ -1380,6 +1381,7 @@ sbiret_t handle_sbi_ecall_TIMER(core_t* core, int32_t fid) {
     switch (fid) {
         case SBI_TIMER__SET_TIMER:
             data->timer = (((uint64_t)core->x_regs[RISCV_R_A1]) << 32) | (uint64_t)(core->x_regs[RISCV_R_A0]);
+            data->timer -= data->time_offset;
             return (sbiret_t){ SBI_SUCCESS, 0 };
     }
     return (sbiret_t){ SBI_ERR_NOT_SUPPORTED, 0 };
