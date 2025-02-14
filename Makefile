@@ -13,6 +13,10 @@ LDFLAGS += -Lvirglrenderer/build/src -lvirglrenderer
 
 CFLAGS += $(DT_CFLAGS)
 
+DEPS := gstreamer-1.0 gstreamer-base-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0
+CFLAGS += $(shell pkg-config --cflags $(DEPS))
+LDFLAGS += $(shell pkg-config --libs $(DEPS))
+
 core.o: core.c core.h riscv_constants.h
 	gcc $(CFLAGS) -c $< -o $@
 emulator.o: emulator.c core.h measure.c reg_macros.h riscv_constants.h virtio_constants.h
