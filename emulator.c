@@ -984,6 +984,11 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
     if (cmd->type == VIRTIO_GPU_CMD_SET_SCANOUT) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_set_scanout);
         fprintf(stderr, "set scanout: res=%u, scan=%u, rect=%ux%u+%u,%u\n", cmd->resource_id, cmd->scanout_id, cmd->r.width, cmd->r.height, cmd->r.x, cmd->r.y); fflush(stderr);
+        if (cmd->resource_id == 0) {
+            resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+            virtiogpu_clear_scanout(vgpu);
+            return sizeof(*resp);
+        }
         struct virgl_renderer_resource_info_ext res_info;
         memset(&res_info, 0, sizeof(res_info));
         __vgpu_check_ret(*resp, virgl_renderer_resource_get_info_ext(cmd->resource_id, &res_info));
