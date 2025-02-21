@@ -631,6 +631,7 @@ typedef struct {
     virtiogpu_request_list_t *fenced_cmds_tail;
     // supplied by environment
     uint32_t* ram;
+    struct virgl_renderer_callbacks virglrenderer_cbs;
     // saved here too because we need it for resets
     int virglrenderer_fd;
     spsc_queue_t *main2io;
@@ -658,11 +659,14 @@ int virtiogpu_virglrenderer_init(virtiogpu_state_t* vgpu, bool first) {
     int ret;
 
     int virgl_flags = VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS /* | VIRGL_RENDERER_USE_EXTERNAL_BLOB */;
-    struct virgl_renderer_callbacks virgl_cbs;
-    memset(&virgl_cbs, 0, sizeof(virgl_cbs));
-    virgl_cbs.version = VIRGL_RENDERER_CALLBACKS_VERSION;
-    virgl_cbs.write_fence = virtiogpu_cb_write_fence;
-    if ((ret = virgl_renderer_init(vgpu, virgl_flags, &virgl_cbs))) {
+
+    struct virgl_renderer_callbacks* virgl_cbs = &vgpu->virglrenderer_cbs;
+    if (first) {
+        virgl_cbs->version = VIRGL_RENDERER_CALLBACKS_VERSION;
+        virgl_cbs->write_fence = virtiogpu_cb_write_fence;
+    }
+
+    if ((ret = virgl_renderer_init(vgpu, virgl_flags, virgl_cbs))) {
         fprintf(stderr, "failed to initialize virgl renderer\n");
         return 2;
     }
