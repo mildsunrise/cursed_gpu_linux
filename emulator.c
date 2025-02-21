@@ -583,6 +583,18 @@ REG_FUNCTIONS(void virtionet_wrap_mem, (core_t *core, virtionet_state_t *vnet, u
 
 #if USE_VIRGLRENDERER
 
+void virgl_log_callback(enum virgl_log_level_flags log_level, const char *message, void*) {
+    if (log_level < VIRGL_LOG_LEVEL_DEBUG) return;
+    const char *pref;
+    if (log_level == VIRGL_LOG_LEVEL_ERROR) pref = "ERR";
+    else if (log_level == VIRGL_LOG_LEVEL_WARNING) pref = "WARN";
+    else if (log_level == VIRGL_LOG_LEVEL_INFO) pref = "INFO";
+    else if (log_level == VIRGL_LOG_LEVEL_DEBUG) pref = "DEBUG";
+    else abort();
+    fprintf(stderr, "[virgl] %s: %s", pref, message);
+    fflush(stderr);
+}
+
 // from <virglrenderer/src/gallium/include/pipe/p_defines.h>:
 #define PIPE_TEXTURE_2D 2
 
@@ -657,6 +669,8 @@ void virtiogpu_cb_write_fence(void *cookie, uint32_t fence);
 
 int virtiogpu_virglrenderer_init(virtiogpu_state_t* vgpu, bool first) {
     int ret;
+    if (first)
+        virgl_set_log_callback(&virgl_log_callback, NULL, NULL);
 
     int virgl_flags = VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS /* | VIRGL_RENDERER_USE_EXTERNAL_BLOB */;
 
