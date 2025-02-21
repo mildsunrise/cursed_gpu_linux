@@ -8,8 +8,8 @@ LDFLAGS =
 
 # use VirGL Renderer to expose a VGPU
 DT_CFLAGS += -DUSE_VIRGLRENDERER
-CFLAGS += -Ivirglrenderer/src
-LDFLAGS += -Lvirglrenderer/build/src -lvirglrenderer
+CFLAGS += -Ivirglrenderer/src -Ivirglrenderer/build/src
+LDFLAGS += -Lvirglrenderer/build/src -lvirglrenderer -Wl,-rpath=$(shell pwd)/virglrenderer/build/src
 
 CFLAGS += $(DT_CFLAGS)
 

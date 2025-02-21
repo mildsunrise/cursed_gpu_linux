@@ -631,6 +631,9 @@ typedef struct {
     virtiogpu_request_list_t *fenced_cmds_tail;
     // supplied by environment
     uint32_t* ram;
+    // saved here too because we need it for resets
+    int virglrenderer_fd;
+    spsc_queue_t *main2io;
     // virtual screen
     bool scanout_present;
     uint32_t scanout_resource;
@@ -648,6 +651,35 @@ typedef struct {
     int scanout_drm_format;
     uint64_t scanout_drm_modifiers;
 } virtiogpu_state_t;
+
+void virtiogpu_cb_write_fence(void *cookie, uint32_t fence);
+
+int virtiogpu_virglrenderer_init(virtiogpu_state_t* vgpu, bool first) {
+    int ret;
+
+    int virgl_flags = VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS /* | VIRGL_RENDERER_USE_EXTERNAL_BLOB */;
+    struct virgl_renderer_callbacks virgl_cbs;
+    memset(&virgl_cbs, 0, sizeof(virgl_cbs));
+    virgl_cbs.version = VIRGL_RENDERER_CALLBACKS_VERSION;
+    virgl_cbs.write_fence = virtiogpu_cb_write_fence;
+    if ((ret = virgl_renderer_init(vgpu, virgl_flags, &virgl_cbs))) {
+        fprintf(stderr, "failed to initialize virgl renderer\n");
+        return 2;
+    }
+    int virglrenderer_fd = virgl_renderer_get_poll_fd();
+    if (virglrenderer_fd < 0) {
+        fprintf(stderr, "virgl renderer thread sync not enabled\n");
+        return 2;
+    }
+
+    if (first) {
+        __checkerrno((vgpu->virglrenderer_fd = dup(virglrenderer_fd)) < 0, "dupping fd");
+    } else {
+        __checkerrno(dup2(virglrenderer_fd, vgpu->virglrenderer_fd) < 0, "dupping fd");
+        spsc_queue_commit(vgpu->main2io); // wake up thread so it polls on the new eventfd
+    }
+    return 0;
+}
 
 void virtiogpu_init_scanout(virtiogpu_state_t* vgpu) {
     gst_init(0, NULL);
@@ -828,7 +860,8 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
             vgpu->fenced_cmds_head = next;
         }
         memset(vgpu, 0, offsetof(virtiogpu_state_t, ram));
-        virgl_renderer_reset();
+        virgl_renderer_cleanup(NULL);
+        virtiogpu_virglrenderer_init(vgpu, false);
         virtiogpu_clear_scanout(vgpu);
     }
     fprintf(stderr, "[VGPU] status: %s\n", virtio_status_to_string(vgpu->Status));
@@ -1901,20 +1934,11 @@ int main() {
 
     data.virglrenderer_fd = -1;
 #ifdef USE_VIRGLRENDERER
-    int virgl_flags = VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS /* | VIRGL_RENDERER_USE_EXTERNAL_BLOB */;
-    struct virgl_renderer_callbacks virgl_cbs;
-    memset(&virgl_cbs, 0, sizeof(virgl_cbs));
-    virgl_cbs.version = VIRGL_RENDERER_CALLBACKS_VERSION;
-    virgl_cbs.write_fence = virtiogpu_cb_write_fence;
-    if ((ret = virgl_renderer_init(&data.gpu, virgl_flags, &virgl_cbs))) {
-        fprintf(stderr, "failed to initialize virgl renderer\n");
-        return 2;
-    }
     data.gpu.ram = data.ram;
-    if ((data.virglrenderer_fd = virgl_renderer_get_poll_fd()) < 0) {
-        fprintf(stderr, "virgl renderer thread sync not enabled\n");
-        return 2;
-    }
+    data.gpu.main2io = &data.main2io;
+    if ((ret = virtiogpu_virglrenderer_init(&data.gpu, true)))
+        return ret;
+    data.virglrenderer_fd = data.gpu.virglrenderer_fd;
     virtiogpu_init_scanout(&data.gpu);
 #endif
 
