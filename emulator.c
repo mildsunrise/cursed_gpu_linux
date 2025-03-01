@@ -1004,7 +1004,7 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
     }
     if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_FLUSH) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_flush);
-        fprintf(stderr, "res=%u, rect=%ux%u+%u,%u\n", cmd->resource_id, cmd->r.width, cmd->r.height, cmd->r.x, cmd->r.y); fflush(stderr);
+        fprintf(stderr, "flush: res=%u, rect=%ux%u+%u,%u\n", cmd->resource_id, cmd->r.width, cmd->r.height, cmd->r.x, cmd->r.y); fflush(stderr);
         resp->type = VIRTIO_GPU_RESP_OK_NODATA;
         __vgpu_assert_cond(vgpu->scanout_present && cmd->resource_id == vgpu->scanout_resource, "invalid flushed resource");
         GstClockTime now = gst_element_get_current_running_time(vgpu->queue);
@@ -1052,12 +1052,14 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
 
     if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_CREATE_3D) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_create_3d);
+        fprintf(stderr, "create 3D resource %d\n", cmd->resource_id);
         __vgpu_check_ret(*resp, virgl_renderer_resource_create((struct virgl_renderer_resource_create_args *)&cmd->resource_id, NULL, 0));
         return sizeof(*resp);
     }
 
     if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_CREATE_2D) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_create_2d);
+        fprintf(stderr, "create 2D resource %d, fmt=%d\n", cmd->resource_id, cmd->format);
         struct virgl_renderer_resource_create_args args = {
             .handle = cmd->resource_id,
             .format = cmd->format,
@@ -1130,6 +1132,7 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
     if (cmd->type == VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_transfer_to_host_2d);
         struct virgl_box box = { cmd->r.x, cmd->r.y, 0, cmd->r.width, cmd->r.height, 1 };
+        fprintf(stderr, "transfer: res=%u, rect=%ux%u+%u,%u, offset=%lu\n", cmd->resource_id, cmd->r.width, cmd->r.height, cmd->r.x, cmd->r.y, cmd->offset); fflush(stderr);
         __vgpu_check_ret(*resp, virgl_renderer_transfer_write_iov(cmd->resource_id, cmd->hdr.ctx_id, 0, 0, 0, &box, cmd->offset, NULL, 0));
         return sizeof(*resp);
     }
@@ -1161,10 +1164,11 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
     if (resp_desc->flags & VIRTQ_DESC_F_NEXT) {
         data_desc = resp_desc;
         desc_idx = data_desc->next;
+        __vgpu_assert_cond(desc_idx < queue->QueueNum, "descriptor 3 bad addr");
         resp_desc = (struct virtq_desc*) &ram[queue->QueueDesc + desc_idx * 4];
         __vgpu_assert_cond(!(data_desc->flags & VIRTQ_DESC_F_WRITE), "middle descriptor is not READ");
     }
-    __vgpu_assert_cond(!(resp_desc->flags & VIRTQ_DESC_F_NEXT), "more than 2 descriptors");
+    __vgpu_assert_cond(!(resp_desc->flags & VIRTQ_DESC_F_NEXT), "more than 3 descriptors");
 
     __vgpu_assert_cond(!(cmd_desc->flags & VIRTQ_DESC_F_WRITE), "descriptor 1 is not READ");
     __vgpu_assert_cond(resp_desc->flags & VIRTQ_DESC_F_WRITE, "descriptor 2 is not WRITE");
@@ -1176,7 +1180,7 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
     const void* data = data_desc ? &vgpu->ram[__VGPU_PREPROCESS_ADDR(data_desc->addr)] : NULL;
     uint32_t data_len = data_desc ? data_desc->len : 0;
 
-    fprintf(stderr, "[VGPU] [%u] %s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", queue_idx, virtio_gpu_ctrl_type_to_string(cmd->type), cmd->flags, cmd->fence_id, cmd->ctx_id, cmd_desc->len - sizeof(struct virtio_gpu_ctrl_hdr));
+    fprintf(stderr, "[VGPU] [%u] %s [flags: %u, fence: %lu, ctx: %u] payload: %lu, data: %u\n", queue_idx, virtio_gpu_ctrl_type_to_string(cmd->type), cmd->flags, cmd->fence_id, cmd->ctx_id, cmd_desc->len - sizeof(struct virtio_gpu_ctrl_hdr), data_len);
 
     memset(resp, 0, sizeof(*resp));
     resp->ctx_id = cmd->ctx_id;
@@ -1188,7 +1192,7 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
     //     ret = virtiogpu_process_cursor_cmd(vgpu, cmd, cmd_desc->len, data, data_len, resp, resp_desc->len);
 
     assert(ret < 0 || ret >= (int)(sizeof(struct virtio_gpu_ctrl_hdr)));
-    if (ret >= 0)
+    if (ret >= 0 && (resp->type != VIRTIO_GPU_RESP_OK_NODATA || ret - sizeof(struct virtio_gpu_ctrl_hdr) > 0))
         fprintf(stderr, "[VGPU]   -> %s [flags: %u, fence: %lu, ctx: %u] payload: %lu\n", virtio_gpu_ctrl_type_to_string(resp->type), resp->flags, resp->fence_id, resp->ctx_id, ret - sizeof(struct virtio_gpu_ctrl_hdr));
     fflush(stderr);
 
@@ -1250,6 +1254,7 @@ int virtiogpu_process_buffer(virtiogpu_state_t* vgpu, uint32_t queue_idx, uint16
             ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = resp_len; \
             new_used++; \
         } \
+        fflush(stderr); \
         vgpu->ram[queue->QueueUsed] &= MASK(16); \
         vgpu->ram[queue->QueueUsed] |= ((uint32_t)new_used) << 16; \
         \
