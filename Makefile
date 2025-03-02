@@ -4,7 +4,7 @@ all: linux_dtb emulator
 
 DT_CFLAGS = -DCLOCK_FREQ=45000000
 CFLAGS = -flto -O3 -g -Wall -Wextra
-LDFLAGS =
+LDFLAGS = -ldl
 
 # use VirGL Renderer to expose a VGPU
 DT_CFLAGS += -DUSE_VIRGLRENDERER
@@ -13,22 +13,37 @@ LDFLAGS += -Lvirglrenderer/build/src -lvirglrenderer -Wl,-rpath=$(shell pwd)/vir
 
 CFLAGS += $(DT_CFLAGS)
 
-DEPS := gstreamer-1.0 gstreamer-base-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0
+DEPS := wayland-client wayland-protocols wayland-egl egl opengl
 CFLAGS += $(shell pkg-config --cflags $(DEPS))
 LDFLAGS += $(shell pkg-config --libs $(DEPS))
+
+WL_PROTOCOLS := stable/xdg-shell/xdg-shell unstable/xdg-decoration/xdg-decoration-unstable-v1
+WL_PROTOCOLS_DIR := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
+WL_PROTOCOLS_CHDRS := $(addprefix wl_protocols/,$(addsuffix .h,$(WL_PROTOCOLS)))
+WL_PROTOCOLS_OBJS := $(addprefix wl_protocols/,$(addsuffix .o,$(WL_PROTOCOLS)))
+wl_protocols/%.c: $(WL_PROTOCOLS_DIR)/%.xml
+	mkdir -p $(@D)
+	wayland-scanner private-code < $< > $@
+wl_protocols/%.h: $(WL_PROTOCOLS_DIR)/%.xml
+	mkdir -p $(@D)
+	wayland-scanner client-header < $< > $@
+wl_protocols/%.o: wl_protocols/%.c
+	gcc $(CFLAGS) -c $< -o $@
 
 core.o: core.c core.h riscv_constants.h
 	gcc $(CFLAGS) -c $< -o $@
 emulator.o: emulator.c core.h measure.c reg_macros.h riscv_constants.h virtio_constants.h
 	gcc $(CFLAGS) -c $< -o $@
-emulator: core.o emulator.o
+console.o: console.c $(WL_PROTOCOLS_CHDRS)
+	gcc $(CFLAGS) -c $< -o $@
+emulator: core.o emulator.o console.o $(WL_PROTOCOLS_OBJS)
 	gcc $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 core_test: core.c core.h test.c measure.c reg_macros.h riscv_constants.h
 	gcc $(CFLAGS) core.c test.c -o $@
 
 clean:
-	rm -f *.o linux_dtb{,.*} emulator core_test
+	rm -rf *.o linux_dtb{,.*} emulator core_test wl_protocols
 
 # kernel
 

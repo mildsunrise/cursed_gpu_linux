@@ -28,11 +28,7 @@
 #include <virglrenderer.h>
 #include <virglrenderer_hw.h>
 
-#include <gst/gstpad.h>
-#include <gst/gstparse.h>
-#include <gst/video/gstvideoaffinetransformationmeta.h>
-#include <gst/video/gstvideometa.h>
-#include <gst/allocators/gstdmabuf.h>
+#include "console.h"
 #endif
 
 #define MASK(n) (~((~0U << (n))))
@@ -643,6 +639,7 @@ typedef struct {
     virtiogpu_request_list_t *fenced_cmds_tail;
     // supplied by environment
     uint32_t* ram;
+    console_t* console;
     struct virgl_renderer_callbacks virglrenderer_cbs;
     // saved here too because we need it for resets
     int virglrenderer_fd;
@@ -650,19 +647,7 @@ typedef struct {
     // virtual screen
     bool scanout_present;
     uint32_t scanout_resource;
-    GstPipeline* pipeline;
-    GstElement* queue;
-    GstPad* pad;
-    GstAllocator* dmabuf_allocator;
-    GstBuffer* scanout_buffer;
-    GstCaps* scanout_caps;
-    GstVideoMeta* scanout_video_meta;
-    gfloat* scanout_transform;
-    GstSegment segment;
-    // only used to know when to re-send caps
-    uint32_t scanout_size [2];
-    int scanout_drm_format;
-    uint64_t scanout_drm_modifiers;
+    console_scanout_flush_t scanout_flush;
 } virtiogpu_state_t;
 
 void virtiogpu_cb_write_fence(void *cookie, uint32_t fence);
@@ -700,77 +685,15 @@ int virtiogpu_virglrenderer_init(virtiogpu_state_t* vgpu, bool first) {
 }
 
 void virtiogpu_init_scanout(virtiogpu_state_t* vgpu) {
-    gst_init(0, NULL);
-
-    GError* error = NULL;
-    GstElement* elem = gst_parse_launch(
-        "queue name=input leaky=downstream max-size-buffers=3 max-size-bytes=0"
-        " ! glimagesink"
-        " fakesrc is-live=true ! fakesink",
-        &error);
-    if (error) {
-        fprintf(stderr, "failed creating pipeline: %s\n", error->message);
-        g_error_free(error);
-        gst_clear_object(&elem);
-        exit(2);
-    }
-    vgpu->pipeline = GST_PIPELINE(elem);
-    vgpu->queue = gst_bin_get_by_name(GST_BIN_CAST(vgpu->pipeline), "input");
-    g_assert_nonnull(vgpu->queue);
-    vgpu->pad = gst_element_get_static_pad(vgpu->queue, "sink");
-    g_assert_nonnull(vgpu->pad);
-
-    {
-        GstStateChangeReturn ret = gst_element_set_state(GST_ELEMENT_CAST(vgpu->pipeline), GST_STATE_PLAYING);
-        if (ret != GST_STATE_CHANGE_ASYNC) {
-            fprintf(stderr, "failed starting pipeline: %s\n", gst_element_state_change_return_get_name(ret));
-            exit(2);
-        }
-    }
-
-    if (!gst_pad_send_event(vgpu->pad, gst_event_new_stream_start(GST_OBJECT_NAME(vgpu->pad)))) {
-        fprintf(stderr, "failed sending preliminary events\n");
-        exit(2);
-    }
-
-    // prepare buffer
-
-    vgpu->scanout_buffer = gst_buffer_new();
-    g_assert_nonnull(vgpu->scanout_buffer);
-    vgpu->scanout_video_meta = NULL;
-
-    GstVideoAffineTransformationMeta* vatMeta =
-        gst_buffer_add_video_affine_transformation_meta(vgpu->scanout_buffer);
-    g_assert_nonnull(vatMeta);
-    vgpu->scanout_transform = vatMeta->matrix;
-
-    gfloat transform [16] =
-        { 1, 0, 0, 0,
-          0, 1, 0, 0,
-          0, 0, 1, 0,
-          0, 0, 0, 1 };
-    memcpy(vgpu->scanout_transform, transform, sizeof(transform));
-
-    // prepare other objects
-
-    gst_segment_init(&vgpu->segment, GST_FORMAT_TIME);
-
-    vgpu->dmabuf_allocator = gst_dmabuf_allocator_new();
-    g_assert_nonnull(vgpu->dmabuf_allocator);
-
-    vgpu->scanout_caps = gst_caps_new_simple("video/x-raw",
-        "format", G_TYPE_STRING, "DMA_DRM", NULL);
-    g_assert_nonnull(vgpu->scanout_caps);
-    gst_caps_set_features_simple(vgpu->scanout_caps,
-        gst_caps_features_from_string (GST_CAPS_FEATURE_MEMORY_DMABUF));
-
     vgpu->scanout_present = false;
 }
 
 void virtiogpu_clear_scanout(virtiogpu_state_t* vgpu) {
     if (!vgpu->scanout_present) return;
     vgpu->scanout_present = false;
-    gst_buffer_remove_all_memory(vgpu->scanout_buffer);
+    console_free_buffer(vgpu->console, vgpu->scanout_flush.buf);
+    vgpu->scanout_flush.buf = NULL;
+    console_update_scanout(vgpu->console, &vgpu->scanout_flush);
 }
 
 void virtiogpu_set_scanout_resource(virtiogpu_state_t* vgpu, struct virgl_renderer_resource_info_ext* res) {
@@ -780,79 +703,26 @@ void virtiogpu_set_scanout_resource(virtiogpu_state_t* vgpu, struct virgl_render
         return;
 
     // set basics
-    virtiogpu_clear_scanout(vgpu);
+    if (vgpu->scanout_present)
+        console_free_buffer(vgpu->console, vgpu->scanout_flush.buf);
     vgpu->scanout_resource = res->base.handle;
     vgpu->scanout_present = true;
 
-    // send caps if needed
-    if (
-        res->base.width != vgpu->scanout_size[0] || res->base.height != vgpu->scanout_size[1] ||
-        res->base.drm_fourcc != vgpu->scanout_drm_format || res->modifiers != vgpu->scanout_drm_modifiers
-    ) {
-        vgpu->scanout_size[0] = res->base.width, vgpu->scanout_size[1] = res->base.height;
-        vgpu->scanout_drm_format = res->base.drm_fourcc;
-        vgpu->scanout_drm_modifiers = res->modifiers;
-        vgpu->scanout_caps = gst_caps_make_writable(vgpu->scanout_caps);
-        g_assert_nonnull(vgpu->scanout_caps);
-        GstStructure* caps_struct = gst_caps_get_structure (vgpu->scanout_caps, 0);
-        g_assert_nonnull(caps_struct);
-        gchar* drm_format = gst_video_dma_drm_fourcc_to_string(vgpu->scanout_drm_format, vgpu->scanout_drm_modifiers);
-        g_assert_nonnull(drm_format);
-        gst_structure_set(caps_struct,
-            "drm-format", G_TYPE_STRING, drm_format,
-            "width", G_TYPE_INT, vgpu->scanout_size[0],
-            "height", G_TYPE_INT, vgpu->scanout_size[1],
-            NULL);
-        g_free(drm_format);
-        if (
-            !gst_pad_send_event(vgpu->pad, gst_event_new_caps(vgpu->scanout_caps)) ||
-            !gst_pad_send_event(vgpu->pad, gst_event_new_segment(&vgpu->segment))
-        ) {
-            fprintf(stderr, "failed to send CAPS or SEGMENT\n");
-            abort();
-        }
-    }
-
-    // export texture
+    // export texture and import to console
     assert(res->planes <= 4);
-    int fds [res->planes];
-    int strides [res->planes];
-    int offsets [res->planes];
-    int export_ret = virgl_renderer_get_fd_for_texture2(res->base.tex_id, fds, strides, offsets);
+    console_buffer_import_data_t import = {
+        .drm_format = res->base.drm_fourcc,
+        .drm_modifiers = res->modifiers,
+        .width = res->base.width,
+        .height = res->base.height,
+        .num_planes = res->planes,
+    };
+    int export_ret = virgl_renderer_get_fd_for_texture2(res->base.tex_id, import.fds, import.strides, import.offsets);
     if (export_ret < 0) {
         fprintf(stderr, "failed to export texture: %s\n", strerror(-export_ret));
         abort();
     }
-
-    // set up video meta
-    if (!vgpu->scanout_video_meta) {
-        gsize offsets_2 [res->planes];
-        for (int i = 0; i < res->planes; i++)
-            offsets_2[i] = offsets[i];
-        vgpu->scanout_video_meta = gst_buffer_add_video_meta_full(vgpu->scanout_buffer,
-            GST_VIDEO_FRAME_FLAG_NONE,
-            GST_VIDEO_FORMAT_DMA_DRM,
-            res->base.width,
-            res->base.height,
-            res->planes,
-            offsets_2, strides);
-    } else {
-        vgpu->scanout_video_meta->width = res->base.width;
-        vgpu->scanout_video_meta->height = res->base.height;
-        vgpu->scanout_video_meta->n_planes = res->planes;
-        for (int i = 0; i < res->planes; i++) {
-            vgpu->scanout_video_meta->stride[i] = strides[i];
-            vgpu->scanout_video_meta->offset[i] = offsets[i];
-        }
-    }
-
-    // add DMABUF memories
-    for (int i = 0; i < res->planes; i++) {
-        GstMemory* mem = gst_dmabuf_allocator_alloc_with_flags(vgpu->dmabuf_allocator, fds[i], /* FIXME */ 1, GST_FD_MEMORY_FLAG_NONE);
-        g_assert_nonnull(mem);
-        GST_MINI_OBJECT_CAST(mem)->flags |= GST_MEMORY_FLAG_READONLY;
-        gst_buffer_append_memory(vgpu->scanout_buffer, mem);
-    }
+    vgpu->scanout_flush.buf = console_import_buffer(vgpu->console, &import);
 }
 
 #define __VGPU_FEATURES_0 ((1 << VIRTIO_GPU_F_VIRGL) | (1 << VIRTIO_GPU_F_CONTEXT_INIT) | (1 << VIRTIO_GPU_F_RESOURCE_UUID))
@@ -996,10 +866,7 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         __vgpu_assert_cond(res_info.base.tex_id > 0 && cmd->scanout_id == 0 && cmd->r.width > 0 && cmd->r.height > 0, "invalid resource or scanout"); // FIXME: turn into return failure
         __vgpu_assert_cond(cmd->r.x + cmd->r.width <= res_info.base.width && cmd->r.y + cmd->r.height <= res_info.base.height, "rectangle falls outside resource"); // FIXME: turn into return failure
         virtiogpu_set_scanout_resource(vgpu, &res_info);
-        vgpu->scanout_transform[0] = res_info.base.width / ((gfloat)cmd->r.width);
-        vgpu->scanout_transform[5] = res_info.base.height / ((gfloat)cmd->r.height);
-        vgpu->scanout_transform[12] = -cmd->r.x / ((gfloat)cmd->r.width);
-        vgpu->scanout_transform[13] = -cmd->r.y / ((gfloat)cmd->r.height);
+        vgpu->scanout_flush.viewport = (console_rectangle_t) { .x = cmd->r.x, .y = cmd->r.y, .w = cmd->r.width, .h = cmd->r.height };
         return sizeof(*resp);
     }
     if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_FLUSH) {
@@ -1007,17 +874,9 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         fprintf(stderr, "flush: res=%u, rect=%ux%u+%u,%u\n", cmd->resource_id, cmd->r.width, cmd->r.height, cmd->r.x, cmd->r.y); fflush(stderr);
         resp->type = VIRTIO_GPU_RESP_OK_NODATA;
         __vgpu_assert_cond(vgpu->scanout_present && cmd->resource_id == vgpu->scanout_resource, "invalid flushed resource");
-        GstClockTime now = gst_element_get_current_running_time(vgpu->queue);
-        if (!GST_CLOCK_TIME_IS_VALID(now)) {
-            fprintf(stderr, "[VGPU] skipping frame because pipeline not ready yet\n");
-            return sizeof(*resp);
-        }
-        GstBuffer* buf = gst_buffer_copy(vgpu->scanout_buffer);
-        g_assert_nonnull(buf);
-        GST_BUFFER_PTS(buf) = GST_BUFFER_DTS(buf) = now;
-        GstFlowReturn ret = gst_pad_chain(vgpu->pad, buf);
-        if (ret != GST_FLOW_OK)
-            fprintf(stderr, "[VGPU] buffer sending failed: %s\n", gst_flow_get_name(ret));
+        __vgpu_assert_cond(cmd->r.x + cmd->r.width <= vgpu->scanout_flush.viewport.w && cmd->r.y + cmd->r.height <= vgpu->scanout_flush.viewport.h, "rectangle falls outside scanout"); // FIXME: turn into return failure
+        vgpu->scanout_flush.damage = (console_rectangle_t) { .x = cmd->r.x, .y = cmd->r.y, .w = cmd->r.width, .h = cmd->r.height };
+        console_update_scanout(vgpu->console, &vgpu->scanout_flush);
         return sizeof(*resp);
     }
 
@@ -1531,6 +1390,7 @@ typedef struct {
     u8250_state_t uart;
     virtionet_state_t vnet;
 #ifdef USE_VIRGLRENDERER
+    console_t* console;
     virtiogpu_state_t gpu;
 #endif
     int virglrenderer_fd;
@@ -1731,7 +1591,13 @@ void *io_thread(void *__arg) {
         { data->uart.in_fd, POLLIN, 0 },
         { data->vnet.tap_fd, POLLIN | POLLOUT, 0 },
         { data->virglrenderer_fd, POLLIN, 0 },
+        { -1, POLLIN, 0 },
     };
+
+#ifdef USE_VIRGLRENDERER
+    pfd[4].fd = console_get_poll_fd(data->console);
+    console_make_current(data->console);
+#endif
 
     while (1) {
         __checkerrno(poll(pfd, sizeof(pfd) / sizeof(*pfd), -1) < 0, "I/O poll");
@@ -1743,6 +1609,11 @@ void *io_thread(void *__arg) {
             if (hdata.stop_requested)
                 break;
         }
+
+#ifdef USE_VIRGLRENDERER
+        if (pfd[4].revents & POLLIN)
+            console_poll(data->console);
+#endif
 
         __IO_THREAD_EVENTS(__IO_THREAD_HANDLE_EVENT)
     }
@@ -1915,6 +1786,10 @@ int main() {
     core.mem_page_table = mem_page_table;
     core.read_time = read_time;
     core.wfi = wfi;
+
+#ifdef USE_VIRGLRENDERER
+    data.console = data.gpu.console = console_new();
+#endif
 
     // set up RAM
     int ramfd = memfd_create("guest_ram", 0);
