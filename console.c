@@ -63,6 +63,9 @@ struct console_t {
     struct wl_egl_window* wl_egl_window;
     EGLSurface egl_surface;
 
+    GLint _attr_model_mat;
+    GLint _attr_texture_mat;
+
     struct wl_display* wl_display;
     struct wl_registry* wl_registry;
 #define WL_DECLARE_GLOBAL(NAME, INTERFACE, VERSION) \
@@ -393,12 +396,74 @@ static void init_egl(console_t* con) {
 
 // GL SETUP + IMPORTING + THREAD SYNC
 
+const char vertex_shader_src[] = {
+#embed "shaders/quad.glsl"
+};
+const char fragment_shader_src[] = {
+#embed "shaders/blit.glsl"
+};
+
 static void check_gl_error(const char* msg) {
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
         fprintf(stderr, "OpenGL error on %s: %#x\n", msg, error);
         exit(2);
     }
+}
+
+#define COMPILE_SHADER(VAR, TYPE) compile_shader(#VAR, VAR, sizeof(VAR), TYPE)
+
+static GLuint compile_shader(const char* name, const char* src, GLint src_len, GLenum type) {
+    GLuint shader = glCreateShader(type);
+    check_gl_error("glCreateShader");
+    glShaderSource(shader, 1, &src, &src_len);
+    check_gl_error("glShaderSource");
+    glCompileShader(shader);
+    check_gl_error("glCompileShader");
+
+    int success;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char log[512];
+        GLsizei log_size;
+        glGetShaderInfoLog(shader, sizeof(log), &log_size, log);
+        check_gl_error("glGetShaderInfoLog");
+        fprintf(stderr, "Shader %s compilation failed. Log:\n", name);
+        fwrite(log, sizeof(*log), log_size, stdout);
+        exit(2);
+    }
+    return shader;
+}
+
+static GLuint link_program(GLuint vertex_shader, GLuint fragment_shader) {
+    GLuint program = glCreateProgram();
+    check_gl_error("glCreateProgram");
+    glAttachShader(program, vertex_shader);
+    check_gl_error("glAttachShader vertex");
+    glAttachShader(program, fragment_shader);
+    check_gl_error("glAttachShader fragment");
+    glLinkProgram(program);
+    check_gl_error("glLinkProgram");
+
+    int success;
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        char log[512];
+        GLsizei log_size;
+        glGetProgramInfoLog(program, sizeof(log), &log_size, log);
+        check_gl_error("glGetProgramInfoLog");
+        fprintf(stderr, "Program link failed. Log:\n");
+        fwrite(log, sizeof(*log), log_size, stdout);
+        exit(2);
+    }
+    return program;
+}
+
+static inline GLint get_uniform_location(GLuint prog, const char *name) {
+    GLint res = glGetUniformLocation(prog, name);
+    check_gl_error("glGetUniformLocation");
+    assert(res != -1);
+    return res;
 }
 
 static void init_gl(console_t* con) {
@@ -408,6 +473,26 @@ static void init_gl(console_t* con) {
 
     eglSwapInterval(con->egl_display, 0);
     check_egl_error("eglSwapInterval(0)");
+
+    GLuint prog = link_program(
+        COMPILE_SHADER(vertex_shader_src, GL_VERTEX_SHADER),
+        COMPILE_SHADER(fragment_shader_src, GL_FRAGMENT_SHADER)
+    );
+    glUseProgram(prog);
+    check_gl_error("glUseProgram");
+    con->_attr_model_mat = get_uniform_location(prog, "modelMat");
+    con->_attr_texture_mat = get_uniform_location(prog, "textureMat");
+    glUniform1i(get_uniform_location(prog, "_texture"), 0);
+    check_gl_error("glUniform1i");
+    glActiveTexture(GL_TEXTURE0);
+    check_gl_error("glActiveTexture(GL_TEXTURE0)");
+
+    // bind a dummy VAO for drawing
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    check_gl_error("glGenVertexArrays");
+    glBindVertexArray(vao);
+    check_gl_error("glBindVertexArray");
 
     draw_frame(con);
 }
@@ -543,9 +628,28 @@ static void draw_frame(console_t* con) {
         xdg_toplevel_set_title(con->wl_toplevel, buf);
     }
 
-    glClearColor(0.1, 0.1, 0.1, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    // TODO: draw
+    GLfloat model_mat [4*4] = {
+        1,0,0,0,
+        0,1,0,0,
+        0,0,1,0,
+        0,0,0,1,
+    };
+    GLfloat texture_mat [3*2] = {
+        1,0,1,
+        0,1,1,
+    };
+    if (con->current_flush.buf) {
+        texture_mat[2] = texture_mat[5] = 0;
+    }
+    for (size_t i = 0; i < 3; i++) texture_mat[3+i] *= -1;
+    texture_mat[5] += 1;
+    glUniformMatrix4fv(con->_attr_model_mat, 1, GL_TRUE, model_mat);
+    check_gl_error("glUniformMatrix4fv");
+    glUniformMatrix3x2fv(con->_attr_texture_mat, 1, GL_TRUE, texture_mat);
+    check_gl_error("glUniformMatrix3x2fv");
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    check_gl_error("glDrawArrays");
 
     eglSwapBuffers(con->egl_display, con->egl_surface);
     check_egl_error("eglSwapBuffers");

@@ -2,8 +2,9 @@ all: linux_dtb emulator
 
 # emulator
 
+CC = clang
 DT_CFLAGS = -DCLOCK_FREQ=45000000
-CFLAGS = -flto -O3 -g -Wall -Wextra
+CFLAGS = -flto -O3 -g -Wall -Wextra -std=c23
 LDFLAGS = -ldl
 
 # use VirGL Renderer to expose a VGPU
@@ -28,19 +29,19 @@ wl_protocols/%.h: $(WL_PROTOCOLS_DIR)/%.xml
 	mkdir -p $(@D)
 	wayland-scanner client-header < $< > $@
 wl_protocols/%.o: wl_protocols/%.c
-	gcc $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
 core.o: core.c core.h riscv_constants.h
-	gcc $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 emulator.o: emulator.c core.h measure.c reg_macros.h riscv_constants.h virtio_constants.h
-	gcc $(CFLAGS) -c $< -o $@
-console.o: console.c $(WL_PROTOCOLS_CHDRS)
-	gcc $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
+console.o: console.c $(WL_PROTOCOLS_CHDRS) shaders/*.glsl
+	$(CC) $(CFLAGS) -c $< -o $@
 emulator: core.o emulator.o console.o $(WL_PROTOCOLS_OBJS)
-	gcc $(CFLAGS) $^ $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 core_test: core.c core.h test.c measure.c reg_macros.h riscv_constants.h
-	gcc $(CFLAGS) core.c test.c -o $@
+	$(CC) $(CFLAGS) core.c test.c -o $@
 
 clean:
 	rm -rf *.o linux_dtb{,.*} emulator core_test wl_protocols
