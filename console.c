@@ -368,7 +368,7 @@ static void init_egl(console_t* con) {
     gladLoaderLoadEGL(con->egl_display);
     assert(GLAD_EGL_VERSION_1_4);
     assert(GLAD_EGL_KHR_create_context);
-    assert(GLAD_EGL_KHR_image_base);
+    assert(GLAD_EGL_KHR_image || GLAD_EGL_KHR_image_base);
     assert(GLAD_EGL_EXT_image_dma_buf_import);
     assert(GLAD_EGL_EXT_image_dma_buf_import_modifiers);
 
@@ -526,7 +526,6 @@ console_buffer_t* console_import_buffer(console_t* con, console_buffer_import_da
     buf->width = buffer->width;
     buf->height = buffer->height;
     DEFINE_EGL_ATTRS(EGLint, image_attrs, 4+4*5);
-    ADD_EGL_ATTR(image_attrs, EGL_IMAGE_PRESERVED_KHR, EGL_TRUE);
     ADD_EGL_ATTR(image_attrs, EGL_WIDTH, buffer->width);
     ADD_EGL_ATTR(image_attrs, EGL_HEIGHT, buffer->height);
     ADD_EGL_ATTR(image_attrs, EGL_LINUX_DRM_FOURCC_EXT, buffer->drm_format);
@@ -548,7 +547,7 @@ void console_free_buffer(console_t* con, console_buffer_t* buf) {
     EGLImage img = buf->egl_image;
     uint8_t nrefs = atomic_fetch_sub(&buf->nrefs, 1);
     assert(nrefs != 0);
-    if (nrefs == 1) {
+    if (nrefs == 1 && img) {
         eglDestroyImageKHR(con->egl_display, img);
         check_egl_error("eglDestroyImageKHR");
     }
@@ -577,6 +576,9 @@ static void free_flush_request(console_t* con, flush_request_t* req) {
 }
 
 void console_update_scanout(console_t* con, console_scanout_flush_t* sc) {
+    // FIXME: hack: this should be in emulator.c but i don't want to load GL there
+    glFlush();
+
     flush_request_t* req = get_flush_request(con);
     req->flush = *sc;
     if (req->flush.buf) {
@@ -610,8 +612,19 @@ static void poll_eventfd(console_t* con, uint64_t /*n*/) {
         check_gl_error("glGenTextures");
         glBindTexture(GL_TEXTURE_2D, sc->buf->tex_id);
         check_gl_error("glBindTexture");
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        check_gl_error("glTexParameteri(GL_TEXTURE_MIN_FILTER)");
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        check_gl_error("glTexParameteri(GL_TEXTURE_MAG_FILTER)");
+
         glEGLImageTargetTexStorageEXT(GL_TEXTURE_2D, sc->buf->egl_image, NULL);
         check_gl_error("glEGLImageTargetTexStorageEXT");
+
+        eglDestroyImageKHR(con->egl_display, sc->buf->egl_image);
+        check_egl_error("eglDestroyImageKHR");
+        sc->buf->egl_image = NULL;
+        sc->buf->is_bound = true;
     }
 
     draw_frame(con);
