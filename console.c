@@ -14,10 +14,11 @@
 #include <wayland-egl.h>
 #include "wl_protocols/stable/xdg-shell/xdg-shell.h"
 #include "wl_protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.h"
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include <GL/gl.h>
-#include <GL/glext.h>
+
+#define GLAD_EGL_IMPLEMENTATION
+#include "glad/egl.h"
+#define GLAD_GL_IMPLEMENTATION
+#include "glad/gl.h"
 
 #define __checkerrno(expr, fmt, ...) \
     if (expr) { \
@@ -345,37 +346,29 @@ static void check_egl_error(const char* msg) {
     NAME[__##NAME##_n++] = (VAL); \
     NAME[__##NAME##_n] = EGL_NONE;
 
-static PFNEGLQUERYDMABUFFORMATSEXTPROC eglQueryDmaBufFormatsEXT;
-static PFNEGLQUERYDMABUFMODIFIERSEXTPROC eglQueryDmaBufModifiersEXT;
-
-static void load_egl_extensions(console_t* con) {
-    // FIXME: use EGL_EXT_platform_base and EGL_KHR_image_base rather than assuming EGL >=1.5
-    const char* exts = eglQueryString(con->egl_display, EGL_EXTENSIONS);
-    check_egl_error("eglQueryString(EXTENSIONS)");
-    if (!strstr(exts, "EGL_EXT_image_dma_buf_import_modifiers")) {
-        // FIXME: maybe try to fall back to EGL_EXT_image_dma_buf_import
-        fprintf(stderr, "DMA-BUF import extension not found\n");
-        exit(1);
-    }
-
-    bool ok = true
-        && (eglQueryDmaBufFormatsEXT = (PFNEGLQUERYDMABUFFORMATSEXTPROC) eglGetProcAddress("eglQueryDmaBufFormatsEXT"))
-        && (eglQueryDmaBufModifiersEXT = (PFNEGLQUERYDMABUFMODIFIERSEXTPROC) eglGetProcAddress("eglQueryDmaBufModifiersEXT"))
-    ;
-    assert(ok);
-}
-
 void console_make_current(console_t* con) {
     eglMakeCurrent(con->egl_display, con->egl_surface, con->egl_surface, con->egl_context);
     check_egl_error("eglMakeCurrent");
 }
 
 static void init_egl(console_t* con) {
-    con->egl_display = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, con->wl_display, NULL);
-    check_egl_error("eglGetPlatformDisplay");
+    gladLoaderLoadEGL(EGL_NO_DISPLAY);
+    assert(GLAD_EGL_VERSION_1_0);
+    assert(GLAD_EGL_EXT_platform_base);
+    assert(GLAD_EGL_EXT_platform_wayland || GLAD_EGL_KHR_platform_wayland);
+
+    con->egl_display = eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_KHR, con->wl_display, NULL);
+    check_egl_error("eglGetPlatformDisplayEXT");
     eglInitialize(con->egl_display, NULL, NULL);
     check_egl_error("eglInitialize");
-    load_egl_extensions(con);
+
+    gladLoaderLoadEGL(con->egl_display);
+    assert(GLAD_EGL_VERSION_1_4);
+    assert(GLAD_EGL_KHR_create_context);
+    assert(GLAD_EGL_KHR_image_base);
+    assert(GLAD_EGL_EXT_image_dma_buf_import);
+    assert(GLAD_EGL_EXT_image_dma_buf_import_modifiers);
+
     DEFINE_EGL_ATTRS(EGLint, config_attrs, 1);
     ADD_EGL_ATTR(config_attrs, EGL_SURFACE_TYPE, EGL_WINDOW_BIT);
     EGLConfig configs [1];
@@ -387,13 +380,13 @@ static void init_egl(console_t* con) {
         exit(2);
     }
 
-    con->egl_surface = eglCreatePlatformWindowSurface(con->egl_display, configs[0], con->wl_egl_window, NULL);
-    check_egl_error("eglCreatePlatformWindowSurface");
+    con->egl_surface = eglCreatePlatformWindowSurfaceEXT(con->egl_display, configs[0], con->wl_egl_window, NULL);
+    check_egl_error("eglCreatePlatformWindowSurfaceEXT");
     eglBindAPI(EGL_OPENGL_API);
     check_egl_error("eglBindAPI");
     DEFINE_EGL_ATTRS(EGLint, context_attrs, 2);
-    ADD_EGL_ATTR(context_attrs, EGL_CONTEXT_MAJOR_VERSION, 3);
-    ADD_EGL_ATTR(context_attrs, EGL_CONTEXT_MINOR_VERSION, 2);
+    ADD_EGL_ATTR(context_attrs, EGL_CONTEXT_MAJOR_VERSION_KHR, 3);
+    ADD_EGL_ATTR(context_attrs, EGL_CONTEXT_MINOR_VERSION_KHR, 2);
     con->egl_context = eglCreateContext(con->egl_display, configs[0], EGL_NO_CONTEXT, context_attrs);
     check_egl_error("eglCreateContext");
 }
@@ -408,53 +401,13 @@ static void check_gl_error(const char* msg) {
     }
 }
 
-#define GL_TEXTURE_EXTERNAL_OES                                0x8D65
-
-static PFNGLGETSTRINGIPROC glGetStringi;
-static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
-
-static bool has_gl_extension(const char* ext_name) {
-    GLint n_exts = 0;
-    glGetIntegerv(GL_NUM_EXTENSIONS, &n_exts);
-    check_gl_error("glGetIntegerv(GL_NUM_EXTENSIONS)");
-    for (GLint i = 0; i < n_exts; i++) {
-        const char* name = (const char*) glGetStringi(GL_EXTENSIONS, i);
-        check_gl_error("glGetStringi(GL_EXTENSIONS)");
-        if (strcmp(name, ext_name) == 0)
-            return true;
-    }
-    return false;
-}
-
-static void load_gl_extensions() {
-    // until EGL 1.5, non-extension functions would fail
-    if (!(glGetStringi = (PFNGLGETSTRINGIPROC) eglGetProcAddress("glGetStringi"))
-        && !(glGetStringi = dlsym(RTLD_DEFAULT, "glGetStringi"))) {
-        abort(); // should never happen i think, we specified OpenGL >= 3 when creating the context
-    }
-
-    if (!has_gl_extension("GL_OES_EGL_image_external")) {
-        // FIXME: maybe try to fall back to GL_OES_EGL_image
-        fprintf(stderr, "GL_OES_EGL_image_external extension not found\n");
-        exit(1);
-    }
-
-    bool ok = true
-        && (glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) eglGetProcAddress("glEGLImageTargetTexture2DOES"))
-    ;
-    assert(ok);
-}
-
 static void init_gl(console_t* con) {
-    load_gl_extensions();
+    gladLoaderLoadGL();
+    assert(GLAD_GL_VERSION_3_2);
+    assert(GLAD_GL_EXT_EGL_image_storage);
 
     eglSwapInterval(con->egl_display, 0);
     check_egl_error("eglSwapInterval(0)");
-
-    GLuint buf_tex_ids [ARRAY_SIZE(con->bufs)];
-    glGenTextures(ARRAY_SIZE(buf_tex_ids), buf_tex_ids);
-    for (size_t i = 0; i < ARRAY_SIZE(buf_tex_ids); i++)
-        con->bufs[i].tex_id = buf_tex_ids[i];
 
     draw_frame(con);
 }
@@ -487,8 +440,8 @@ console_buffer_t* console_import_buffer(console_t* con, console_buffer_import_da
     buf->is_bound = false;
     buf->width = buffer->width;
     buf->height = buffer->height;
-    DEFINE_EGL_ATTRS(EGLAttrib, image_attrs, 4+4*5);
-    ADD_EGL_ATTR(image_attrs, EGL_IMAGE_PRESERVED, EGL_TRUE);
+    DEFINE_EGL_ATTRS(EGLint, image_attrs, 4+4*5);
+    ADD_EGL_ATTR(image_attrs, EGL_IMAGE_PRESERVED_KHR, EGL_TRUE);
     ADD_EGL_ATTR(image_attrs, EGL_WIDTH, buffer->width);
     ADD_EGL_ATTR(image_attrs, EGL_HEIGHT, buffer->height);
     ADD_EGL_ATTR(image_attrs, EGL_LINUX_DRM_FOURCC_EXT, buffer->drm_format);
@@ -496,8 +449,8 @@ console_buffer_t* console_import_buffer(console_t* con, console_buffer_import_da
     IMPORT_PLANE(1);
     IMPORT_PLANE(2);
     IMPORT_PLANE(3);
-    buf->egl_image = eglCreateImage(con->egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, image_attrs);
-    check_egl_error("eglCreateImage");
+    buf->egl_image = eglCreateImageKHR(con->egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, image_attrs);
+    check_egl_error("eglCreateImageKHR");
     for (int i = 0; i < buffer->num_planes; i++)
         __checkerrno(close(buffer->fds[i]), "closing plane %d", i);
     return buf;
@@ -511,8 +464,8 @@ void console_free_buffer(console_t* con, console_buffer_t* buf) {
     uint8_t nrefs = atomic_fetch_sub(&buf->nrefs, 1);
     assert(nrefs != 0);
     if (nrefs == 1) {
-        eglDestroyImage(con->egl_display, img);
-        check_egl_error("eglDestroyImage");
+        eglDestroyImageKHR(con->egl_display, img);
+        check_egl_error("eglDestroyImageKHR");
     }
 }
 
@@ -564,10 +517,16 @@ static void poll_eventfd(console_t* con, uint64_t /*n*/) {
     assert(nrefs != 0);
 
     if (sc->buf && !sc->buf->is_bound) {
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, sc->buf->tex_id);
+        if (sc->buf->tex_id) {
+            glDeleteTextures(1, &sc->buf->tex_id);
+            check_gl_error("glDeleteTextures");
+        }
+        glGenTextures(1, &sc->buf->tex_id);
+        check_gl_error("glGenTextures");
+        glBindTexture(GL_TEXTURE_2D, sc->buf->tex_id);
         check_gl_error("glBindTexture");
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, sc->buf->egl_image);
-        check_gl_error("glEGLImageTargetTexture2DOES");
+        glEGLImageTargetTexStorageEXT(GL_TEXTURE_2D, sc->buf->egl_image, NULL);
+        check_gl_error("glEGLImageTargetTexStorageEXT");
     }
 
     draw_frame(con);

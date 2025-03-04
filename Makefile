@@ -13,7 +13,7 @@ LDFLAGS += -Lvirglrenderer/build/src -lvirglrenderer -Wl,-rpath=$(shell pwd)/vir
 
 CFLAGS += $(DT_CFLAGS)
 
-DEPS := wayland-client wayland-protocols wayland-egl egl opengl
+DEPS := wayland-client wayland-protocols wayland-egl
 CFLAGS += $(shell pkg-config --cflags $(DEPS))
 LDFLAGS += $(shell pkg-config --libs $(DEPS))
 
