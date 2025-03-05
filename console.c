@@ -648,14 +648,18 @@ static void draw_frame(console_t* con) {
         0,0,0,1,
     };
     GLfloat texture_mat [3*2] = {
-        1,0,1,
-        0,1,1,
+        0,0,2,
+        0,0,2,
     };
-    if (con->current_flush.buf) {
-        texture_mat[2] = texture_mat[5] = 0;
+    if (sc->buf) {
+        GLfloat w = sc->buf->width, h = sc->buf->height;
+        texture_mat[0] = sc->viewport.w / w;
+        texture_mat[2] = sc->viewport.x / w;
+        texture_mat[4] = sc->viewport.h / h;
+        texture_mat[5] = sc->viewport.y / h;
     }
-    for (size_t i = 0; i < 3; i++) texture_mat[3+i] *= -1;
-    texture_mat[5] += 1;
+    for (size_t i = 0; i < 4; i++) model_mat[4+i] *= -1;
+    model_mat[4+3] += 1;
     glUniformMatrix4fv(con->_attr_model_mat, 1, GL_TRUE, model_mat);
     check_gl_error("glUniformMatrix4fv");
     glUniformMatrix3x2fv(con->_attr_texture_mat, 1, GL_TRUE, texture_mat);
