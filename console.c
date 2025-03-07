@@ -91,9 +91,12 @@ struct console_t {
     struct wl_egl_window* wl_egl_window;
     EGLSurface egl_surface;
 
-    GLint _attr_model_mat;
-    GLint _attr_texture_mat;
+    GLint _prog_blit;
+    GLint _attr_blit_model_mat;
+    GLint _attr_blit_texture_mat;
+    GLint _prog_bg;
     GLint _attr_bg_cell_size;
+    GLint _attr_bg_cell_offset;
 
     struct wl_display* wl_display;
     struct wl_registry* wl_registry;
@@ -515,11 +518,18 @@ static void init_egl(console_t* con) {
 
 // GL SETUP + IMPORTING + THREAD SYNC
 
+#define IDENTITY_3x2 { \
+    1,0,0, \
+    0,1,0, }
+
 const char vertex_shader_src[] = {
 #embed "shaders/quad.glsl"
 };
-const char fragment_shader_src[] = {
+const char blit_fragment_shader_src[] = {
 #embed "shaders/blit.glsl"
+};
+const char bg_fragment_shader_src[] = {
+#embed "shaders/bg.glsl"
 };
 
 static void check_gl_error(const char* msg) {
@@ -593,19 +603,26 @@ static void init_gl(console_t* con) {
     eglSwapInterval(con->egl_display, 0);
     check_egl_error("eglSwapInterval(0)");
 
-    GLuint prog = link_program(
-        COMPILE_SHADER(vertex_shader_src, GL_VERTEX_SHADER),
-        COMPILE_SHADER(fragment_shader_src, GL_FRAGMENT_SHADER)
-    );
-    glUseProgram(prog);
+    GLuint v_shader = COMPILE_SHADER(vertex_shader_src, GL_VERTEX_SHADER);
+
+    con->_prog_blit = link_program(v_shader, COMPILE_SHADER(blit_fragment_shader_src, GL_FRAGMENT_SHADER));
+    glUseProgram(con->_prog_blit);
     check_gl_error("glUseProgram");
-    con->_attr_model_mat = get_uniform_location(prog, "modelMat");
-    con->_attr_texture_mat = get_uniform_location(prog, "textureMat");
-    con->_attr_bg_cell_size = get_uniform_location(prog, "bgCellSize");
-    glUniform1i(get_uniform_location(prog, "_texture"), 0);
+    con->_attr_blit_model_mat = get_uniform_location(con->_prog_blit, "modelMat");
+    con->_attr_blit_texture_mat = get_uniform_location(con->_prog_blit, "textureMat");
+    glUniform1i(get_uniform_location(con->_prog_blit, "_texture"), 0);
     check_gl_error("glUniform1i");
     glActiveTexture(GL_TEXTURE0);
     check_gl_error("glActiveTexture(GL_TEXTURE0)");
+
+    con->_prog_bg = link_program(v_shader, COMPILE_SHADER(bg_fragment_shader_src, GL_FRAGMENT_SHADER));
+    glUseProgram(con->_prog_bg);
+    check_gl_error("glUseProgram");
+    con->_attr_bg_cell_size = get_uniform_location(con->_prog_bg, "bgCellSize");
+    con->_attr_bg_cell_offset = get_uniform_location(con->_prog_bg, "bgCellOffset");
+    GLfloat model_mat [3*2] = IDENTITY_3x2;
+    glUniformMatrix3x2fv(get_uniform_location(con->_prog_bg, "modelMat"), 1, GL_TRUE, model_mat);
+    check_gl_error("glUniformMatrix3x2fv");
 
     // bind a dummy VAO for drawing
     GLuint vao;
@@ -734,6 +751,11 @@ static void poll_eventfd(console_t* con, uint64_t /*n*/) {
         glBindTexture(GL_TEXTURE_2D, sc->buf->tex_id);
         check_gl_error("glBindTexture");
 
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        check_gl_error("glTexParameteri(GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S)");
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        check_gl_error("glTexParameteri(GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_T)");
+
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         check_gl_error("glTexParameteri(GL_TEXTURE_MIN_FILTER)");
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -785,41 +807,50 @@ static void draw_frame(console_t* con) {
     wl_surface_set_opaque_region(con->wl_surface, region);
     wl_region_destroy(region);
 
-    if (!sc->buf) {
-        xdg_toplevel_set_title(con->wl_toplevel, "Emulator (no output)");
-    } else {
-        char buf [128];
-        snprintf(buf, sizeof(buf), "Emulator (%u×%u)", sc->viewport.w, sc->viewport.h);
-        xdg_toplevel_set_title(con->wl_toplevel, buf);
-    }
-
-    GLfloat model_mat [3*2] = {
-        1,0,0,
-        0,1,0,
-    };
-    GLfloat texture_mat [3*2] = {
-        0,0,2,
-        0,0,2,
-    };
-    if (sc->buf) {
-        GLfloat w = sc->buf->width, h = sc->buf->height;
-        texture_mat[0] = sc->viewport.w / w;
-        texture_mat[2] = sc->viewport.x / w;
-        texture_mat[4] = sc->viewport.h / h;
-        texture_mat[5] = sc->viewport.y / h;
-    }
-    for (size_t i = 0; i < 3; i++) model_mat[3+i] *= -1;
-    model_mat[3+2] += 1;
-    glUniformMatrix3x2fv(con->_attr_model_mat, 1, GL_TRUE, model_mat);
-    check_gl_error("glUniformMatrix4fv");
-    glUniformMatrix3x2fv(con->_attr_texture_mat, 1, GL_TRUE, texture_mat);
-    check_gl_error("glUniformMatrix3x2fv");
-    glUniform1f(con->_attr_bg_cell_size, 10 * pixel_scale);
+    glUseProgram(con->_prog_bg);
+    check_gl_error("glUseProgram");
+    glUniform1f(con->_attr_bg_cell_size, 11 * pixel_scale);
     check_gl_error("glUniform1f");
-
+    glUniform2f(con->_attr_bg_cell_offset, w/2., h/2.);
+    check_gl_error("glUniform2f");
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     check_gl_error("glDrawArrays");
 
+    if (!sc->buf) {
+        xdg_toplevel_set_title(con->wl_toplevel, "Emulator (no output)");
+        eglSwapBuffers(con->egl_display, con->egl_surface);
+        check_egl_error("eglSwapBuffers");
+        return;
+    }
+
+    GLfloat model_mat [3*2] = IDENTITY_3x2;
+    GLfloat texture_mat [3*2] = IDENTITY_3x2;
+    GLfloat buf_w = sc->buf->width, buf_h = sc->buf->height;
+    texture_mat[0] = sc->viewport.w / buf_w;
+    texture_mat[2] = sc->viewport.x / buf_w;
+    texture_mat[4] = sc->viewport.h / buf_h;
+    texture_mat[5] = sc->viewport.y / buf_h;
+    double scale_fit = fmin(w / (double)sc->viewport.w, h / (double)sc->viewport.h);
+    double scale = fmin(scale_fit, pixel_scale);
+    model_mat[0] = sc->viewport.w * scale / w;
+    model_mat[4] = sc->viewport.h * scale / h;
+    model_mat[2] = (1 - model_mat[0]) / 2;
+    model_mat[5] = (1 - model_mat[4]) / 2;
+    for (size_t i = 0; i < 3; i++) model_mat[3+i] *= -1;
+    model_mat[3+2] += 1;
+
+    glUseProgram(con->_prog_blit);
+    check_gl_error("glUseProgram");
+    glUniformMatrix3x2fv(con->_attr_blit_model_mat, 1, GL_TRUE, model_mat);
+    check_gl_error("glUniformMatrix4fv");
+    glUniformMatrix3x2fv(con->_attr_blit_texture_mat, 1, GL_TRUE, texture_mat);
+    check_gl_error("glUniformMatrix3x2fv");
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    check_gl_error("glDrawArrays");
+
+    char buf [128];
+    snprintf(buf, sizeof(buf), "Emulator (%u×%u, %d%%)", sc->viewport.w, sc->viewport.h, (int)(scale * 100));
+    xdg_toplevel_set_title(con->wl_toplevel, buf);
     eglSwapBuffers(con->egl_display, con->egl_surface);
     check_egl_error("eglSwapBuffers");
 }
