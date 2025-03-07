@@ -793,11 +793,9 @@ static void draw_frame(console_t* con) {
         xdg_toplevel_set_title(con->wl_toplevel, buf);
     }
 
-    GLfloat model_mat [4*4] = {
-        1,0,0,0,
-        0,1,0,0,
-        0,0,1,0,
-        0,0,0,1,
+    GLfloat model_mat [3*2] = {
+        1,0,0,
+        0,1,0,
     };
     GLfloat texture_mat [3*2] = {
         0,0,2,
@@ -810,9 +808,9 @@ static void draw_frame(console_t* con) {
         texture_mat[4] = sc->viewport.h / h;
         texture_mat[5] = sc->viewport.y / h;
     }
-    for (size_t i = 0; i < 4; i++) model_mat[4+i] *= -1;
-    model_mat[4+3] += 1;
-    glUniformMatrix4fv(con->_attr_model_mat, 1, GL_TRUE, model_mat);
+    for (size_t i = 0; i < 3; i++) model_mat[3+i] *= -1;
+    model_mat[3+2] += 1;
+    glUniformMatrix3x2fv(con->_attr_model_mat, 1, GL_TRUE, model_mat);
     check_gl_error("glUniformMatrix4fv");
     glUniformMatrix3x2fv(con->_attr_texture_mat, 1, GL_TRUE, texture_mat);
     check_gl_error("glUniformMatrix3x2fv");

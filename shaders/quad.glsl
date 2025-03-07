@@ -2,7 +2,7 @@
 precision highp float;
 
 out vec2 texPos;
-uniform mat4 modelMat;
+uniform mat3x2 modelMat;
 uniform mat3x2 textureMat;
 
 const vec2 aPos[4] = vec2[](
@@ -12,7 +12,7 @@ const vec2 aPos[4] = vec2[](
     vec2(1., 1.));
 
 void main() {
-    vec4 pos = modelMat * vec4(aPos[gl_VertexID], 0.5, 1.);
-    gl_Position = vec4(pos.xyz * 2 - 1, pos.w);
-    texPos = textureMat * vec3(aPos[gl_VertexID], 1.);
+    vec3 pos = vec3(aPos[gl_VertexID], 1.);
+    gl_Position = vec4((modelMat * pos) * 2 - 1, 0, 1);
+    texPos = textureMat * pos;
 }
