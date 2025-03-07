@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
 #include <stdatomic.h>
@@ -92,6 +93,7 @@ struct console_t {
 
     GLint _attr_model_mat;
     GLint _attr_texture_mat;
+    GLint _attr_bg_cell_size;
 
     struct wl_display* wl_display;
     struct wl_registry* wl_registry;
@@ -388,6 +390,9 @@ static const struct zxdg_toplevel_decoration_v1_listener xdg_decoration_listener
     .configure = xdg_decoration_configure,
 };
 
+static const int32_t MIN_SIZE [2] = { 100, 100 };
+static const int32_t INITIAL_SIZE [2] = { 800, 600 };
+
 static void init_wayland(console_t* con) {
     con->configuring_state = INITIAL_WINDOW_STATE;
 
@@ -412,15 +417,8 @@ static void init_wayland(console_t* con) {
 
     xdg_toplevel_set_title(con->wl_toplevel, "Emulator console");
     xdg_toplevel_set_app_id(con->wl_toplevel, "sh.alba.cursed_gpu_linux");
-    xdg_toplevel_set_min_size(con->wl_toplevel, 800, 600);
-    xdg_toplevel_set_max_size(con->wl_toplevel, 800, 600);
-    struct wl_region* region = wl_compositor_create_region(con->wl_compositor);
-    assert(region);
-    wl_region_add(region, 0, 0, 800, 600);
-    wl_surface_set_input_region(con->wl_surface, region);
-    wl_surface_set_opaque_region(con->wl_surface, region);
-    wl_region_destroy(region);
-    con->wl_egl_window = wl_egl_window_create(con->wl_surface, 800, 600);
+    xdg_toplevel_set_min_size(con->wl_toplevel, MIN_SIZE[0], MIN_SIZE[1]);
+    con->wl_egl_window = wl_egl_window_create(con->wl_surface, INITIAL_SIZE[0], INITIAL_SIZE[1]);
     assert(con->wl_egl_window);
 
     if (con->wl_fractional_scale_manager && con->wl_viewporter) {
@@ -603,6 +601,7 @@ static void init_gl(console_t* con) {
     check_gl_error("glUseProgram");
     con->_attr_model_mat = get_uniform_location(prog, "modelMat");
     con->_attr_texture_mat = get_uniform_location(prog, "textureMat");
+    con->_attr_bg_cell_size = get_uniform_location(prog, "bgCellSize");
     glUniform1i(get_uniform_location(prog, "_texture"), 0);
     check_gl_error("glUniform1i");
     glActiveTexture(GL_TEXTURE0);
@@ -754,6 +753,37 @@ static void poll_eventfd(console_t* con, uint64_t /*n*/) {
 
 static void draw_frame(console_t* con) {
     console_scanout_flush_t* sc = &con->current_flush;
+    window_state_t* st = &con->configured_state;
+
+    // window size (surface coordinates)
+    int32_t window_w =
+        st->width ? st->width :
+        st->bounds_width && st->bounds_width < INITIAL_SIZE[0] ? st->bounds_width :
+        INITIAL_SIZE[0];
+    int32_t window_h =
+        st->height ? st->height :
+        st->bounds_height && st->bounds_height < INITIAL_SIZE[1] ? st->bounds_height :
+        INITIAL_SIZE[1];
+    assert(window_w > 0 && window_h > 0);
+
+    // render size (FIXME: check correct rounding according to fractional scaling protocol)
+    double pixel_scale = st->scale / 120.;
+    size_t w = round(window_w * pixel_scale);
+    size_t h = round(window_h * pixel_scale);
+    wl_egl_window_resize(con->wl_egl_window, w, h, 0, 0);
+    glViewport(0, 0, w, h);
+
+    // communicate window size to compositor
+    if (con->wl_fractional_scale)
+        wp_viewport_set_destination(con->wl_viewport, window_w, window_h);
+    else
+        wl_surface_set_buffer_scale(con->wl_surface, st->scale / 120);
+    struct wl_region* region = wl_compositor_create_region(con->wl_compositor);
+    assert(region);
+    wl_region_add(region, 0, 0, window_w, window_h);
+    wl_surface_set_input_region(con->wl_surface, region);
+    wl_surface_set_opaque_region(con->wl_surface, region);
+    wl_region_destroy(region);
 
     if (!sc->buf) {
         xdg_toplevel_set_title(con->wl_toplevel, "Emulator (no output)");
@@ -786,6 +816,8 @@ static void draw_frame(console_t* con) {
     check_gl_error("glUniformMatrix4fv");
     glUniformMatrix3x2fv(con->_attr_texture_mat, 1, GL_TRUE, texture_mat);
     check_gl_error("glUniformMatrix3x2fv");
+    glUniform1f(con->_attr_bg_cell_size, 10 * pixel_scale);
+    check_gl_error("glUniform1f");
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     check_gl_error("glDrawArrays");

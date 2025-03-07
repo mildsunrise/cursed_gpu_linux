@@ -5,7 +5,7 @@ all: linux_dtb emulator
 CC = clang
 DT_CFLAGS = -DCLOCK_FREQ=45000000
 CFLAGS = -flto -O3 -g -Wall -Wextra -std=c23
-LDFLAGS = -ldl
+LDFLAGS = -ldl -lm
 
 # use VirGL Renderer to expose a VGPU
 DT_CFLAGS += -DUSE_VIRGLRENDERER
