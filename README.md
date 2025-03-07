@@ -73,7 +73,7 @@ cd ..
 Once the rootfs is built, clone Linux under `linux` in the repo:
 
 ~~~ bash
-git clone https://github.com/torvalds/linux.git -b v5.19-rc5 --depth=1
+git clone https://github.com/torvalds/linux.git -b v6.13 --depth=1
 ~~~
 
 Then build using the provided `linux_config` and the toolchain produced by Buildroot:
