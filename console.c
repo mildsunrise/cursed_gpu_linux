@@ -14,6 +14,8 @@
 #include <wayland-egl.h>
 #include "wl_protocols/stable/xdg-shell/xdg-shell.h"
 #include "wl_protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.h"
+#include "wl_protocols/stable/viewporter/viewporter.h"
+#include "wl_protocols/staging/fractional-scale/fractional-scale-v1.h"
 
 #define GLAD_EGL_IMPLEMENTATION
 #include "glad/egl.h"
@@ -36,6 +38,29 @@ struct console_buffer_t {
     EGLImage egl_image;
 };
 
+// holds double-buffered commit state, i.e. the kind of state that should
+// only enter into effect atomically when xdg_surface.configure is called
+typedef struct {
+    // window geometry suggested in xdg_toplevel.configure
+    int32_t width, height;
+
+    // window geometry bounds in xdg_toplevel.configure_bounds
+    int32_t bounds_width, bounds_height;
+
+    enum wl_output_transform transform;
+
+    // holds the preferred_scale if the fractional scale protocol is supported,
+    // or the preferred_buffer_scale if not. always units of x120
+    uint32_t scale;
+} window_state_t;
+
+static const window_state_t INITIAL_WINDOW_STATE = {
+    .width = 0, .height = 0,
+    .bounds_width = 0, .bounds_height = 0,
+    .transform = WL_OUTPUT_TRANSFORM_NORMAL,
+    .scale = 120,
+};
+
 typedef struct {
     _Atomic uint8_t nrefs;
     console_scanout_flush_t flush;
@@ -44,6 +69,8 @@ typedef struct {
 #define WL_GLOBALS(MACRO) \
     MACRO(wl_xdg, xdg_wm_base, 1) \
     MACRO(wl_xdg_decoration, zxdg_decoration_manager_v1, 1) \
+    MACRO(wl_viewporter, wp_viewporter, 1) \
+    MACRO(wl_fractional_scale_manager, wp_fractional_scale_manager_v1, 1) \
     MACRO(wl_compositor, wl_compositor, 4)
 
 struct console_t {
@@ -76,8 +103,15 @@ WL_GLOBALS(WL_DECLARE_GLOBAL)
     struct wl_surface* wl_surface;
     struct xdg_surface* wl_xdg_surface;
     struct xdg_toplevel* wl_toplevel;
+    struct wp_viewport* wl_viewport;
+    struct wp_fractional_scale_v1* wl_fractional_scale;
     struct zxdg_toplevel_decoration_v1* wl_decoration;
     bool xdg_decoration_configure_done;
+    bool xdg_configure_done;
+    window_state_t configured_state;
+    window_state_t configuring_state;
+    // used only during start-up to ensure correct ordering
+    bool do_draw_frames;
 };
 
 // EVENT LOOP
@@ -232,9 +266,13 @@ static const struct xdg_wm_base_listener xdg_listener = {
     .ping = xdg_ping,
 };
 
-static void xdg_configure(void * /*__data*/, struct xdg_surface *xdg_surface, uint32_t serial) {
-    //console_t* con = (console_t*) __data;
+static void xdg_configure(void * __data, struct xdg_surface *xdg_surface, uint32_t serial) {
+    console_t* con = (console_t*) __data;
     xdg_surface_ack_configure(xdg_surface, serial);
+    con->xdg_configure_done = true;
+    con->configured_state = con->configuring_state;
+    if (con->do_draw_frames)
+        draw_frame(con);
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -247,19 +285,27 @@ static void xdg_close(void * /*__data*/, struct xdg_toplevel *) {
 }
 
 static void xdg_tl_configure(
-    void */*data*/,
+    void *__data,
     struct xdg_toplevel */*xdg_toplevel*/,
-    int32_t /*width*/,
-    int32_t /*height*/,
+    int32_t width,
+    int32_t height,
     struct wl_array */*states*/
-) {}
+) {
+    console_t* con = (console_t*) __data;
+    con->configuring_state.width = width;
+    con->configuring_state.height = height;
+}
 
 static void xdg_tl_configure_bounds(
-    void */*data*/,
+    void *__data,
     struct xdg_toplevel */*xdg_toplevel*/,
-    int32_t /*width*/,
-    int32_t /*height*/
-) {}
+    int32_t width,
+    int32_t height
+) {
+    console_t* con = (console_t*) __data;
+    con->configuring_state.bounds_width = width;
+    con->configuring_state.bounds_height = height;
+}
 
 static void xdg_wm_capabilities(
     void */*data*/,
@@ -274,6 +320,63 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener = {
     .wm_capabilities = xdg_wm_capabilities,
 };
 
+static void wl_surface_enter(
+    void */*__data*/,
+    struct wl_surface */*wl_surface*/,
+    struct wl_output */*output*/
+) {}
+
+static void wl_surface_leave(
+    void */*__data*/,
+    struct wl_surface */*wl_surface*/,
+    struct wl_output */*output*/
+) {}
+
+static void wl_surface_preferred_buffer_scale(
+    void *__data,
+    struct wl_surface */*wl_surface*/,
+    int32_t factor
+) {
+    console_t* con = (console_t*) __data;
+    assert(factor > 0);
+    if (con->wl_fractional_scale) {
+        if (factor != 1)
+            fprintf(stderr, "Warning: compositor reported buffer scale %d while also supporting the fractional scale protocol... ignoring buffer scale.\n", factor);
+    } else {
+        con->configuring_state.scale = factor * 120;
+    }
+}
+
+static void wl_surface_preferred_buffer_transform(
+    void *__data,
+    struct wl_surface */*wl_surface*/,
+    uint32_t transform
+) {
+    console_t* con = (console_t*) __data;
+    con->configuring_state.transform = transform;
+}
+
+static const struct wl_surface_listener wl_surface_listener = {
+    .enter = wl_surface_enter,
+    .leave = wl_surface_leave,
+    .preferred_buffer_scale = wl_surface_preferred_buffer_scale,
+    .preferred_buffer_transform = wl_surface_preferred_buffer_transform,
+};
+
+static void wl_preferred_fractional_scale(
+    void *__data,
+    struct wp_fractional_scale_v1 */*wp_fractional_scale_v1*/,
+    uint32_t scale
+) {
+    console_t* con = (console_t*) __data;
+    assert(scale > 0);
+    con->configuring_state.scale = scale;
+}
+
+static const struct wp_fractional_scale_v1_listener wp_fractional_scale_listener = {
+    .preferred_scale = wl_preferred_fractional_scale,
+};
+
 static void xdg_decoration_configure(void *__data, struct zxdg_toplevel_decoration_v1 *, uint32_t mode) {
     console_t* con = (console_t*) __data;
     if (mode != ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
@@ -286,6 +389,8 @@ static const struct zxdg_toplevel_decoration_v1_listener xdg_decoration_listener
 };
 
 static void init_wayland(console_t* con) {
+    con->configuring_state = INITIAL_WINDOW_STATE;
+
     con->wl_registry = wl_display_get_registry(con->wl_display);
     assert(con->wl_registry);
     wl_registry_add_listener(con->wl_registry, &registry_listener, con);
@@ -296,6 +401,7 @@ static void init_wayland(console_t* con) {
 
     con->wl_surface = wl_compositor_create_surface(con->wl_compositor);
     assert(con->wl_surface);
+    wl_surface_add_listener(con->wl_surface, &wl_surface_listener, con);
 
     con->wl_xdg_surface = xdg_wm_base_get_xdg_surface(con->wl_xdg, con->wl_surface);
     assert(con->wl_xdg_surface);
@@ -309,24 +415,39 @@ static void init_wayland(console_t* con) {
     xdg_toplevel_set_min_size(con->wl_toplevel, 800, 600);
     xdg_toplevel_set_max_size(con->wl_toplevel, 800, 600);
     struct wl_region* region = wl_compositor_create_region(con->wl_compositor);
+    assert(region);
     wl_region_add(region, 0, 0, 800, 600);
     wl_surface_set_input_region(con->wl_surface, region);
     wl_surface_set_opaque_region(con->wl_surface, region);
+    wl_region_destroy(region);
     con->wl_egl_window = wl_egl_window_create(con->wl_surface, 800, 600);
     assert(con->wl_egl_window);
+
+    if (con->wl_fractional_scale_manager && con->wl_viewporter) {
+        con->wl_fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(con->wl_fractional_scale_manager, con->wl_surface);
+        assert(con->wl_fractional_scale);
+        wp_fractional_scale_v1_add_listener(con->wl_fractional_scale, &wp_fractional_scale_listener, con);
+    }
+
+    if (con->wl_viewporter) {
+        con->wl_viewport = wp_viewporter_get_viewport(con->wl_viewporter, con->wl_surface);
+        assert(con->wl_viewport);
+    }
 
     if (con->wl_xdg_decoration) {
         con->wl_decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(con->wl_xdg_decoration, con->wl_toplevel);
         assert(con->wl_decoration);
         zxdg_toplevel_decoration_v1_add_listener(con->wl_decoration, &xdg_decoration_listener, con);
         zxdg_toplevel_decoration_v1_set_mode(con->wl_decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
-        while (!con->xdg_decoration_configure_done)
-            __checkerrno(wl_display_roundtrip(con->wl_display) < 0, "wl_display_roundtrip");
     } else {
         fprintf(stderr,
             "You are using one of the only compositors that don't implement server-side decorations, "
             "likely because it refuses to do so. You will thus have no decorations. Sorry.\n");
     }
+
+    wl_surface_commit(con->wl_surface);
+    while (!con->xdg_configure_done || !(!con->wl_xdg_decoration || con->xdg_decoration_configure_done))
+        __checkerrno(wl_display_roundtrip(con->wl_display) < 0, "wl_display_roundtrip");
 }
 
 // EGL SET UP
@@ -494,6 +615,7 @@ static void init_gl(console_t* con) {
     glBindVertexArray(vao);
     check_gl_error("glBindVertexArray");
 
+    con->do_draw_frames = true;
     draw_frame(con);
 }
 

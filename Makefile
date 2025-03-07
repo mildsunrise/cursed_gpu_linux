@@ -18,7 +18,7 @@ DEPS := wayland-client wayland-protocols wayland-egl
 CFLAGS += $(shell pkg-config --cflags $(DEPS))
 LDFLAGS += $(shell pkg-config --libs $(DEPS))
 
-WL_PROTOCOLS := stable/xdg-shell/xdg-shell unstable/xdg-decoration/xdg-decoration-unstable-v1
+WL_PROTOCOLS := stable/xdg-shell/xdg-shell unstable/xdg-decoration/xdg-decoration-unstable-v1 staging/fractional-scale/fractional-scale-v1 stable/viewporter/viewporter
 WL_PROTOCOLS_DIR := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 WL_PROTOCOLS_CHDRS := $(addprefix wl_protocols/,$(addsuffix .h,$(WL_PROTOCOLS)))
 WL_PROTOCOLS_OBJS := $(addprefix wl_protocols/,$(addsuffix .o,$(WL_PROTOCOLS)))
