@@ -87,7 +87,7 @@ make
 cd ..
 ~~~
 
-Then, either build the virglrenderer dependency or disable VGPU as indicated in [Virtual GPU](#virtual-gpu).
+Then either build the virglrenderer dependency or disable VGPU, as indicated in [Virtual GPU](#virtual-gpu).
 
 Now build the DTB and the emulator:
 
@@ -101,7 +101,7 @@ And run the emulator (for now you'll need to either run it as root, or set up a 
 sudo -E ./emulator
 ~~~
 
-The paths to the DTB and the kernel are hardcoded in `emulator.c`, change them if needed.
+The path to the kernel is hardcoded in `emulator.c`, change it if needed.
 You should see the Linux UART output appear on stdout, and emulator messages will be printed to stderr.
 
 ### Virtual UART

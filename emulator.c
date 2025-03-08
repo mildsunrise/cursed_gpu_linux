@@ -1639,6 +1639,10 @@ void io_thread_handler(uint8_t event, void *__arg) {
 
 // main emulation
 
+const char emulator_dtb[] = {
+#embed "linux_dtb"
+};
+
 #define __checkerrno_file(expr, callname) \
     __checkerrno(expr, callname " \"%s\"", name)
 
@@ -1804,8 +1808,7 @@ int main() {
     map_file_into_ram(&ram_cursor, "linux/arch/riscv/boot/Image");
     // load at last MB to prevent kernel / initrd from overwriting it
     uint32_t dtb_addr = RAM_SIZE - 1024 * 1024;
-    ram_cursor = ((char*)data.ram) + dtb_addr;
-    read_file_into_ram(&ram_cursor, "linux_dtb");
+    memcpy(((char*)data.ram) + dtb_addr, emulator_dtb, sizeof(emulator_dtb));
 
     data.timer = 0xFFFFFFFFFFFFFFFF;
     core.s_mode = true;

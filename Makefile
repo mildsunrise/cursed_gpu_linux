@@ -1,4 +1,4 @@
-all: linux_dtb emulator
+all: emulator
 
 # emulator
 
@@ -33,7 +33,7 @@ wl_protocols/%.o: wl_protocols/%.c
 
 core.o: core.c core.h riscv_constants.h
 	$(CC) $(CFLAGS) -c $< -o $@
-emulator.o: emulator.c core.h measure.c reg_macros.h riscv_constants.h virtio_constants.h
+emulator.o: emulator.c core.h measure.c reg_macros.h riscv_constants.h virtio_constants.h linux_dtb
 	$(CC) $(CFLAGS) -c $< -o $@
 console.o: console.c $(WL_PROTOCOLS_CHDRS) shaders/*.glsl
 	$(CC) $(CFLAGS) -c $< -o $@
