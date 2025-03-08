@@ -1756,11 +1756,13 @@ static void wfi(core_t* core) {
             read_eventfd(pfd[0].fd);
             spsc_queue_read_all(&data->io2main, main_io_handler, core);
         }
-        if (pfd[1].revents & POLLIN)
+        if (pfd[1].revents & POLLIN) {
             core->sip |= RISCV_INT_STI_BIT;
+            pfd[1].events = 0;
+        }
     }
 
-    if (!(pfd[1].revents & POLLIN)) {
+    if (!(core->sip & core->sie & RISCV_INT_STI_BIT)) {
         struct timespec end;
         __checkerrno(clock_gettime(CLOCK_MONOTONIC, &end), "clock_gettime");
         ticks = (end.tv_sec - start.tv_sec) * 1000000000 + (end.tv_nsec - start.tv_nsec);

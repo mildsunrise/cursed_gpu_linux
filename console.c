@@ -111,6 +111,7 @@ WL_GLOBALS(WL_DECLARE_GLOBAL)
     struct wp_viewport* wl_viewport;
     struct wp_fractional_scale_v1* wl_fractional_scale;
     struct zxdg_toplevel_decoration_v1* wl_decoration;
+    bool registry_enum_done;
     bool xdg_decoration_configure_done;
     bool xdg_configure_done;
     window_state_t configured_state;
@@ -231,9 +232,13 @@ static void registry_global(
     uint32_t /*version*/
 ) {
     console_t* con = (console_t*) __data;
+    if (con->registry_enum_done) return;
 #define WL_BIND_GLOBAL(NAME, INTERFACE, VERSION) \
     if (strcmp(interface, (INTERFACE##_interface).name) == 0) { \
-        assert(!con->NAME); \
+        if (con->NAME) { \
+            fprintf(stderr, "compositor bound multiple instances of " #INTERFACE ", ignoring non-first ones\n"); \
+            return; \
+        } \
         con->__##NAME##_name = name; \
         con->NAME = wl_registry_bind(wl_registry, name, & INTERFACE##_interface, VERSION); \
         assert(con->NAME); \
@@ -251,7 +256,7 @@ static void registry_global_remove(
     console_t* con = (console_t*) __data;
 #define WL_UNBIND_GLOBAL(NAME, INTERFACE, VERSION) \
     if (name == con->__##NAME##_name && con->NAME) { \
-        fprintf(stderr, "compositor tried to remove global" #INTERFACE " of name=%u\n", name); \
+        fprintf(stderr, "compositor tried to remove global " #INTERFACE " of name=%u\n", name); \
         abort(); \
     }
 WL_GLOBALS(WL_UNBIND_GLOBAL)
@@ -403,6 +408,7 @@ static void init_wayland(console_t* con) {
     assert(con->wl_registry);
     wl_registry_add_listener(con->wl_registry, &registry_listener, con);
     __checkerrno(wl_display_roundtrip(con->wl_display) < 0, "wl_display_roundtrip");
+    con->registry_enum_done = true;
 
     assert(con->wl_compositor && con->wl_xdg);
     xdg_wm_base_add_listener(con->wl_xdg, &xdg_listener, con);
