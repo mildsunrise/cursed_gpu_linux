@@ -22,6 +22,13 @@ void console_make_current(console_t* con);
 // call on activity on the poll FD
 void console_poll(console_t* con);
 
+// set user data passed to callbacks
+void console_set_cb_data(console_t* con, void* data);
+
+// called from console_poll() when window is closed (can be called multiple times)
+typedef void(*console_stop_cb)(void* data);
+void console_set_stop_cb(console_t* con, console_stop_cb cb);
+
 // to be called from emulation thread
 // ----------------------------------
 

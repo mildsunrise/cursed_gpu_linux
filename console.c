@@ -79,6 +79,9 @@ struct console_t {
     int event_fd;
     bool wl_waiting_for_write;
 
+    void* cb_data;
+    console_stop_cb cb_stop;
+
     // pools to avoid frequent malloc
     console_buffer_t bufs [4];
     flush_request_t flushes [4];
@@ -220,6 +223,14 @@ static void wayland_pre_poll(console_t* con) {
     }
 }
 
+void console_set_cb_data(console_t* con, void* data) {
+    con->cb_data = data;
+}
+
+void console_set_stop_cb(console_t* con, console_stop_cb cb) {
+    con->cb_stop = cb;
+}
+
 // WAYLAND SET UP
 
 static void draw_frame(console_t* con);
@@ -289,9 +300,10 @@ static const struct xdg_surface_listener xdg_surface_listener = {
     .configure = xdg_configure,
 };
 
-static void xdg_close(void * /*__data*/, struct xdg_toplevel *) {
-    fprintf(stderr, "window closed, exiting...\n");
-    exit(0);
+static void xdg_close(void * __data, struct xdg_toplevel *) {
+    console_t* con = (console_t*) __data;
+    fprintf(stderr, "window closed, stopping...\n");
+    con->cb_stop(con->cb_data);
 }
 
 static void xdg_tl_configure(

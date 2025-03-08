@@ -1407,6 +1407,9 @@ typedef struct {
     // it has found an irrecoverable error and exited.
     spsc_queue_t io2main;
     spsc_queue_t main2io;
+
+    // for use by I/O thread only
+    bool io_thread_requested_stop;
 } emu_state_t;
 
 // we define fetch separately because it's much simpler (width is fixed,
@@ -1583,6 +1586,17 @@ static void io_thread_handler(uint8_t event, void *__arg);
     macro(3, POLLIN, IO_EVENT_VGPU) \
     //
 
+#ifdef USE_VIRGLRENDERER
+static void io_console_stop(void* __data) {
+    emu_state_t *data = (emu_state_t *) __data;
+    if (!data->io_thread_requested_stop) {
+        spsc_queue_write(&data->io2main, IO_EVENT_STOP);
+        spsc_queue_commit(&data->io2main);
+        data->io_thread_requested_stop = true;
+    }
+}
+#endif
+
 void *io_thread(void *__arg) {
     emu_state_t *data = (emu_state_t *) __arg;
     struct pollfd pfd [] = {
@@ -1594,6 +1608,8 @@ void *io_thread(void *__arg) {
     };
 
 #ifdef USE_VIRGLRENDERER
+    console_set_cb_data(data->console, data);
+    console_set_stop_cb(data->console, io_console_stop);
     pfd[4].fd = console_get_poll_fd(data->console);
     console_make_current(data->console);
 #endif
@@ -1685,6 +1701,9 @@ void main_io_handler(uint8_t event, void *__arg) {
     core_t *core = (core_t *) __arg;
     emu_state_t *data = (emu_state_t *) core->user_data;
     switch (event) {
+        case IO_EVENT_STOP:
+            data->stopped = true;
+            break;
         case IO_EVENT_UART_RX:
             data->uart.in_ready = true;
             emulator_update_uart_interrupts(core);
@@ -1754,7 +1773,7 @@ static void wfi(core_t* core) {
         pfd[1].events |= POLLIN;
     }
 
-    while (!(core->sip & core->sie)) {
+    while (!(core->sip & core->sie) && !data->stopped) {
         __checkerrno(poll(pfd, sizeof(pfd) / sizeof(*pfd), -1) < 0, "WFI poll");
         if (pfd[0].revents & POLLIN) {
             read_eventfd(pfd[0].fd);
