@@ -648,6 +648,7 @@ typedef struct {
     bool scanout_present;
     uint32_t scanout_resource;
     console_scanout_flush_t scanout_flush;
+    console_scanout_size_t scanout_size; // suggested scanout size
 } virtiogpu_state_t;
 
 void virtiogpu_cb_write_fence(void *cookie, uint32_t fence);
@@ -846,8 +847,8 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
         resp->pmodes[0].enabled = 1;
         resp->pmodes[0].r.x = 0;
         resp->pmodes[0].r.y = 0;
-        resp->pmodes[0].r.width = 800;
-        resp->pmodes[0].r.height = 600;
+        resp->pmodes[0].r.width = vgpu->scanout_size.width;
+        resp->pmodes[0].r.height = vgpu->scanout_size.height;
         return sizeof(*resp);
     }
 
@@ -872,7 +873,10 @@ int virtiogpu_process_control_cmd(virtiogpu_state_t* vgpu, const struct virtio_g
     if (cmd->type == VIRTIO_GPU_CMD_RESOURCE_FLUSH) {
         __vgpu_safe_cast(cmd, const struct virtio_gpu_resource_flush);
         resp->type = VIRTIO_GPU_RESP_OK_NODATA;
-        __vgpu_assert_cond(vgpu->scanout_present && cmd->resource_id == vgpu->scanout_resource, "invalid flushed resource");
+        if (!(vgpu->scanout_present && cmd->resource_id == vgpu->scanout_resource)) {
+            fprintf(stderr, "[VGPU] invalid flushed resource %u, ignoring\n", cmd->resource_id);
+            return sizeof(*resp);
+        }
         __vgpu_assert_cond(cmd->r.x + cmd->r.width <= vgpu->scanout_flush.viewport.w && cmd->r.y + cmd->r.height <= vgpu->scanout_flush.viewport.h, "rectangle falls outside scanout"); // FIXME: turn into return failure
         vgpu->scanout_flush.damage = (console_rectangle_t) { .x = cmd->r.x, .y = cmd->r.y, .w = cmd->r.width, .h = cmd->r.height };
         console_update_scanout(vgpu->console, &vgpu->scanout_flush);
@@ -1380,6 +1384,7 @@ typedef enum {
     IO_EVENT_VNET_RX,
     IO_EVENT_VNET_TX,
     IO_EVENT_VGPU,
+    IO_EVENT_VGPU_NEW_SCANOUT_SIZE,
 } io_event_t;
 
 typedef struct {
@@ -1595,6 +1600,11 @@ static void io_console_stop(void* __data) {
         data->io_thread_requested_stop = true;
     }
 }
+static void io_console_new_scanout_size(void* __data) {
+    emu_state_t *data = (emu_state_t *) __data;
+    spsc_queue_write(&data->io2main, IO_EVENT_VGPU_NEW_SCANOUT_SIZE);
+    spsc_queue_commit(&data->io2main);
+}
 #endif
 
 void *io_thread(void *__arg) {
@@ -1610,6 +1620,7 @@ void *io_thread(void *__arg) {
 #ifdef USE_VIRGLRENDERER
     console_set_cb_data(data->console, data);
     console_set_stop_cb(data->console, io_console_stop);
+    console_set_new_scanout_size_cb(data->console, io_console_new_scanout_size);
     pfd[4].fd = console_get_poll_fd(data->console);
     console_make_current(data->console);
 #endif
@@ -1725,6 +1736,14 @@ void main_io_handler(uint8_t event, void *__arg) {
             spsc_queue_commit(&data->main2io);
             if (data->gpu.InterruptStatus)
                 emulator_update_vgpu_interrupts(core);
+            break;
+        case IO_EVENT_VGPU_NEW_SCANOUT_SIZE:
+            console_get_scanout_size(data->console, &data->gpu.scanout_size);
+            if (!(data->gpu.Status & VIRTIO_STATUS__DRIVER_OK) || (data->gpu.Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
+                break;
+            data->gpu.pending_events |= VIRTIO_GPU_EVENT_DISPLAY;
+            data->gpu.InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+            emulator_update_vgpu_interrupts(core);
             break;
 #endif
         default:
@@ -1866,6 +1885,7 @@ int main() {
         return ret;
     data.virglrenderer_fd = data.gpu.virglrenderer_fd;
     virtiogpu_init_scanout(&data.gpu);
+    console_get_scanout_size(data.console, &data.gpu.scanout_size);
 #endif
 
     // start I/O thread

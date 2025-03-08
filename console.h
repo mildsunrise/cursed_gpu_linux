@@ -29,8 +29,23 @@ void console_set_cb_data(console_t* con, void* data);
 typedef void(*console_stop_cb)(void* data);
 void console_set_stop_cb(console_t* con, console_stop_cb cb);
 
+// called from console_poll() when suggested scanout size has changed.
+// this won't fire before console_get_scanout_size()'s first call,
+// and when fired, it won't fire again until console_get_scanout_size() is called.
+typedef void(*console_new_scanout_size_cb)(void* data);
+void console_set_new_scanout_size_cb(console_t* con, console_new_scanout_size_cb cb);
+
 // to be called from emulation thread
 // ----------------------------------
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+} console_scanout_size_t;
+
+// get current suggested scanout size. after the first call, this must ONLY
+// be called in response to new_scanout_size firing
+void console_get_scanout_size(console_t* con, /* no transfer */ console_scanout_size_t* ssize);
 
 typedef struct {
     uint32_t drm_format;

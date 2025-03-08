@@ -67,6 +67,11 @@ typedef struct {
     console_scanout_flush_t flush;
 } flush_request_t;
 
+typedef struct {
+    _Atomic uint8_t nrefs;
+    console_scanout_size_t ssize;
+} scanout_size_request_t;
+
 #define WL_GLOBALS(MACRO) \
     MACRO(wl_xdg, xdg_wm_base, 1) \
     MACRO(wl_xdg_decoration, zxdg_decoration_manager_v1, 1) \
@@ -80,14 +85,18 @@ struct console_t {
     bool wl_waiting_for_write;
 
     void* cb_data;
+    console_new_scanout_size_cb cb_new_scanout_size;
     console_stop_cb cb_stop;
 
     // pools to avoid frequent malloc
     console_buffer_t bufs [4];
     flush_request_t flushes [4];
+    scanout_size_request_t ssize_reqs [3];
 
     _Atomic (flush_request_t*) pending_flush;
     console_scanout_flush_t current_flush;
+    console_scanout_size_t scanout_size;
+    _Atomic (scanout_size_request_t*) pending_scanout_size;
 
     EGLDisplay egl_display;
     EGLContext egl_context;
@@ -229,6 +238,10 @@ void console_set_cb_data(console_t* con, void* data) {
 
 void console_set_stop_cb(console_t* con, console_stop_cb cb) {
     con->cb_stop = cb;
+}
+
+void console_set_new_scanout_size_cb(console_t* con, console_new_scanout_size_cb cb) {
+    con->cb_new_scanout_size = cb;
 }
 
 // WAYLAND SET UP
@@ -791,6 +804,8 @@ static void poll_eventfd(console_t* con, uint64_t /*n*/) {
     draw_frame(con);
 }
 
+static void set_scanout_size(console_t* con, uint32_t width, uint32_t height);
+
 static void draw_frame(console_t* con) {
     console_scanout_flush_t* sc = &con->current_flush;
     window_state_t* st = &con->configured_state;
@@ -812,6 +827,8 @@ static void draw_frame(console_t* con) {
     size_t h = round(window_h * pixel_scale);
     wl_egl_window_resize(con->wl_egl_window, w, h, 0, 0);
     glViewport(0, 0, w, h);
+
+    set_scanout_size(con, window_w, window_h);
 
     // communicate window size to compositor
     if (con->wl_fractional_scale)
@@ -871,4 +888,39 @@ static void draw_frame(console_t* con) {
     xdg_toplevel_set_title(con->wl_toplevel, buf);
     eglSwapBuffers(con->egl_display, con->egl_surface);
     check_egl_error("eglSwapBuffers");
+}
+
+static scanout_size_request_t* get_ssize_request(console_t* con) {
+    for (size_t i = 0; i < ARRAY_SIZE(con->ssize_reqs); i++) {
+        uint8_t nrefs = 0;
+        if (atomic_compare_exchange_strong(&con->ssize_reqs[i].nrefs, &nrefs, 1))
+            return &con->ssize_reqs[i];
+    }
+    fprintf(stderr, "assertion failed: no free scanout size requests to take\n");
+    abort();
+}
+
+// careful, we call this from both threads
+static void free_ssize_request(console_t* /*con*/, scanout_size_request_t* req) {
+    uint8_t nrefs = atomic_fetch_sub(&req->nrefs, 1);
+    assert(nrefs != 0);
+}
+
+static void set_scanout_size(console_t* con, uint32_t width, uint32_t height) {
+    if (con->scanout_size.width == width && con->scanout_size.height == height) return;
+    con->scanout_size.width = width, con->scanout_size.height = height;
+    scanout_size_request_t* req = get_ssize_request(con);
+    req->ssize = con->scanout_size;
+    req = atomic_exchange(&con->pending_scanout_size, req);
+    if (req)
+        free_ssize_request(con, req);
+    else if (con->cb_new_scanout_size)
+        con->cb_new_scanout_size(con->cb_data);
+}
+
+void console_get_scanout_size(console_t* con, console_scanout_size_t *ssize) {
+    scanout_size_request_t* req = atomic_exchange(&con->pending_scanout_size, NULL);
+    assert(req);
+    *ssize = req->ssize;
+    free_ssize_request(con, req);
 }
