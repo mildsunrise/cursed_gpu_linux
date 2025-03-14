@@ -31,6 +31,65 @@
 
 #define ARRAY_SIZE(x) ((sizeof x) / (sizeof *x))
 
+// SPSC circular queue, with separate write/commit steps
+
+typedef struct {
+    // the write head (atomic + local writer copy)
+    _Atomic uint8_t write_head_at;
+    uint8_t write_head;
+    // the read head (local reader)
+    uint8_t read_head;
+    // an eventfd (written to by writer, after each commit to the atomic)
+    int eventfd;
+    // elements buffer (shared)
+    uint8_t buffer [16];
+} spsc_queue_t;
+
+static void spsc_queue_init(spsc_queue_t *queue) {
+    memset(queue, 0, sizeof(*queue));
+    queue->eventfd = eventfd(0, 0);
+    assert(queue->eventfd >= 0);
+    atomic_init(&queue->write_head_at, 0);
+    assert(atomic_is_lock_free(&queue->write_head_at));
+}
+
+// writes an item to the queue
+//
+// warning: there are NO CHECKS for overflows, caller is responsible
+// to make sure not to write more elements than queue capacity
+// (sizeof(queue->buffer) / sizeof(*queue->buffer) - 1)
+static void spsc_queue_write(spsc_queue_t *queue, uint8_t value) {
+    queue->buffer[queue->write_head] = value;
+    queue->write_head++;
+    if (queue->write_head == sizeof(queue->buffer) / sizeof(*queue->buffer))
+        queue->write_head = 0;
+}
+
+// makes the written items visible to the reader end
+static void spsc_queue_commit(spsc_queue_t *queue) {
+    atomic_store_explicit(&queue->write_head_at, queue->write_head, memory_order_release);
+
+    uint64_t wake_value = 1;
+    int ret = write(queue->eventfd, &wake_value, sizeof(wake_value));
+    assert(ret == sizeof(wake_value));
+}
+
+// reads all pending items from the queue, returning true if there were items to read
+static bool spsc_queue_read_all(spsc_queue_t *queue, void (*cb)(uint8_t value, void *cookie), void *cookie) {
+    uint8_t head = atomic_load_explicit(&queue->write_head_at, memory_order_relaxed);
+    if (likely(queue->read_head == head))
+        return false;
+    atomic_thread_fence(memory_order_acquire);
+
+    while (queue->read_head != head) {
+        cb(queue->buffer[queue->read_head], cookie);
+        queue->read_head++;
+        if (queue->read_head == sizeof(queue->buffer) / sizeof(*queue->buffer))
+            queue->read_head = 0;
+    }
+    return true;
+}
+
 struct console_buffer_t {
     _Atomic uint8_t nrefs;
     bool is_bound;
