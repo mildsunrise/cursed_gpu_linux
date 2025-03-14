@@ -18,6 +18,7 @@ The full emulator exposes a few peripherals:
  - 8250/16550 UART for console, mapped as stdin/stdout
  - virtio-net v2 interface, mapped as TAP interface (no extra features)
  - virtio-gpu supporting only VirGL (through virglrenderer), with a [virtual output](https://tech.lgbt/@mildsunrise/114106697163003943)
+ - virtio-input exposing Wayland pointer/keyboard events on the console window
 
 [![Interacting with the emulated machine through the console (recording)](https://asciinema.org/a/IFZeNgyV6Glf3TBrc5Nn08QjL.svg)](https://asciinema.org/a/IFZeNgyV6Glf3TBrc5Nn08QjL)
 
@@ -160,3 +161,5 @@ ninja -C build
 ~~~
 
 The window is currently fixed at 800×600, and will display whatever is output by the guest (which may choose to disobey the recommended size) scaled up or down, without preserving aspect ratio. The window starts displaying a checkerboard pattern when no output is being displayed by the guest (either because it didn't yet set it up, or because it cleared it). It currently does not support client-side decorations, so if you are in Mutter (which refuses to implement server-side decorations) you'll just see a bare window.
+
+Disabling the VGPU also disables the virtio-input device, since there's no window to draw input events from.

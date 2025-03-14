@@ -31,6 +31,8 @@
 #include "console.h"
 #endif
 
+#define ARRAY_SIZE(x) ((sizeof x) / (sizeof *x))
+
 #define MASK(n) (~((~0U << (n))))
 #define unlikely(x) __builtin_expect((x),0)
 #define likely(x) __builtin_expect((x),1)
@@ -293,10 +295,15 @@ typedef struct {
     bool fd_ready;
 } virtionet_queue_t;
 
+const uint32_t virtionet_features [] = {
+    0,
+    1, // VIRTIO_F_VERSION_1
+};
+
 typedef struct {
     // feature negotiation
     uint32_t DeviceFeaturesSel;
-    uint32_t DriverFeatures;
+    uint32_t DriverFeatures [ARRAY_SIZE(virtionet_features)];
     uint32_t DriverFeaturesSel;
     // queue config
     uint32_t QueueSel;
@@ -311,8 +318,6 @@ typedef struct {
     void *cookie;
 } virtionet_state_t;
 
-#define __VNET_FEATURES_0 0
-#define __VNET_FEATURES_1 1 // VIRTIO_F_VERSION_1
 #define __VNET_QUEUE_NUM_MAX 1024
 #define __VNET_QUEUE (vnet->queues[vnet->QueueSel])
 
@@ -326,6 +331,11 @@ void virtionet_set_fail(virtionet_state_t* vnet) {
 }
 
 void virtionet_update_status(virtionet_state_t* vnet, uint32_t status) {
+    if ((status & VIRTIO_STATUS__FEATURES_OK) && !(vnet->DriverFeatures[1] & 1)) {
+        fprintf(stderr, "[VNET] version 1 feature flag not accepted, failing\n");
+        virtionet_set_fail(vnet);
+        return;
+    }
     vnet->Status |= status;
     if (!status) { // reset
         virtionet_state_t old_vnet = *vnet;
@@ -474,26 +484,24 @@ void virtionet_notify_queue(virtionet_state_t* vnet, uint32_t queueIdx) {
         R(case 0: /* MagicValue (R) */ \
             *value = __VIRTIO_MAGIC; return true;) \
         R(case 1: /* Version (R) */ \
-            *value = __VIRTIO_ID_NET; return true;) \
+            *value = 2; return true;) \
         R(case 2: /* DeviceID (R) */ \
-            *value = 1; return true;) \
+            *value = __VIRTIO_ID_NET; return true;) \
         R(case 3: /* VendorID (R) */ \
             *value = VIRTIO_VENDOR_ID; return true;) \
         \
         R(case 4: /* DeviceFeatures (R) */ \
-            *value = \
-                vnet->DeviceFeaturesSel == 0 ? __VNET_FEATURES_0 : \
-                vnet->DeviceFeaturesSel == 1 ? __VNET_FEATURES_1 : \
-                0; return true;) \
+            *value = vnet->DeviceFeaturesSel < ARRAY_SIZE(virtionet_features) ? virtionet_features[vnet->DeviceFeaturesSel] : 0; return true;) \
         W(case 5: /* DeviceFeaturesSel (W) */ \
             vnet->DeviceFeaturesSel = value; return true;) \
         W(case 8: /* DriverFeatures (W) */ \
-            vnet->DriverFeaturesSel == 0 ? (vnet->DriverFeatures = value) : 0; return true;) \
+            vnet->DriverFeaturesSel < ARRAY_SIZE(virtionet_features) && !(value & ~virtionet_features[vnet->DriverFeaturesSel]) ? \
+                (vnet->DriverFeatures[vnet->DriverFeaturesSel] = value) : virtionet_set_fail(vnet); return true;) \
         W(case 9: /* DriverFeaturesSel (W) */ \
             vnet->DriverFeaturesSel = value; return true;) \
         \
         W(case 12: /* QueueSel (W) */ \
-            if (value < (sizeof(vnet->queues) / sizeof(*(vnet->queues)))) \
+            if (value < ARRAY_SIZE(vnet->queues)) \
                 vnet->QueueSel = value; \
             else \
                 virtionet_set_fail(vnet); \
@@ -528,7 +536,7 @@ void virtionet_notify_queue(virtionet_state_t* vnet, uint32_t queueIdx) {
             if (value) virtionet_set_fail(vnet); return true;) \
         \
         W(case 20: /* QueueNotify (W) */ \
-            if (value < (sizeof(vnet->queues) / sizeof(*(vnet->queues)))) \
+            if (value < ARRAY_SIZE(vnet->queues)) \
                 virtionet_notify_queue(vnet, value); \
             else \
                 virtionet_set_fail(vnet); \
@@ -621,10 +629,15 @@ typedef struct virtiogpu_request_list_t {
     struct virtiogpu_request_list_t *next;
 } virtiogpu_request_list_t;
 
+const uint32_t virtiogpu_features [] = {
+    ((1 << VIRTIO_GPU_F_VIRGL) | (1 << VIRTIO_GPU_F_CONTEXT_INIT) | (1 << VIRTIO_GPU_F_RESOURCE_UUID)),
+    1, // VIRTIO_F_VERSION_1
+};
+
 typedef struct {
     // feature negotiation
     uint32_t DeviceFeaturesSel;
-    uint32_t DriverFeatures;
+    uint32_t DriverFeatures [ARRAY_SIZE(virtiogpu_features)];
     uint32_t DriverFeaturesSel;
     // queue config
     uint32_t QueueSel;
@@ -726,8 +739,6 @@ void virtiogpu_set_scanout_resource(virtiogpu_state_t* vgpu, struct virgl_render
     vgpu->scanout_flush.buf = console_import_buffer(vgpu->console, &import);
 }
 
-#define __VGPU_FEATURES_0 ((1 << VIRTIO_GPU_F_VIRGL) | (1 << VIRTIO_GPU_F_CONTEXT_INIT) | (1 << VIRTIO_GPU_F_RESOURCE_UUID))
-#define __VGPU_FEATURES_1 1 // VIRTIO_F_VERSION_1
 #define __VGPU_QUEUE_NUM_MAX 1024
 #define __VGPU_QUEUE (vgpu->queues[vgpu->QueueSel])
 
@@ -741,6 +752,11 @@ void virtiogpu_set_fail(virtiogpu_state_t* vgpu) {
 }
 
 void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
+    if ((status & VIRTIO_STATUS__FEATURES_OK) && !(vgpu->DriverFeatures[1] & 1)) {
+        fprintf(stderr, "[VGPU] version 1 feature flag not accepted, failing\n");
+        virtiogpu_set_fail(vgpu);
+        return;
+    }
     vgpu->Status |= status;
     if (!status) { // reset
         while (vgpu->fenced_cmds_head) {
@@ -755,19 +771,6 @@ void virtiogpu_update_status(virtiogpu_state_t* vgpu, uint32_t status) {
     }
     fprintf(stderr, "[VGPU] status: %s\n", virtio_status_to_string(vgpu->Status));
 }
-
-// requires existing 'desc_idx' to use as iteration variable, and input 'buffer_idx'.
-#define __VGPU_ITERATE_BUFFER(checked, body) \
-    desc_idx = buffer_idx; \
-    while (1) { \
-        if (checked && desc_idx >= queue->QueueNum) \
-            return virtiogpu_set_fail(vgpu); \
-        uint32_t* desc = &ram[queue->QueueDesc + desc_idx * 4]; \
-        uint16_t desc_flags = desc[3]; \
-        body \
-        if (!(desc_flags & VIRTQ_DESC_F_NEXT)) break; \
-        desc_idx = desc[3] >> 16; \
-    }
 
 #define __vgpu_assert_cond(COND, MESSAGE) \
     if (!(COND)) { \
@@ -1182,19 +1185,17 @@ void virtiogpu_cb_write_fence(void *cookie, uint32_t fence) {
             *value = VIRTIO_VENDOR_ID; return true;) \
         \
         R(case 4: /* DeviceFeatures (R) */ \
-            *value = \
-                vgpu->DeviceFeaturesSel == 0 ? __VGPU_FEATURES_0 : \
-                vgpu->DeviceFeaturesSel == 1 ? __VGPU_FEATURES_1 : \
-                0; return true;) \
+            *value = vgpu->DeviceFeaturesSel < ARRAY_SIZE(virtiogpu_features) ? virtiogpu_features[vgpu->DeviceFeaturesSel] : 0; return true;) \
         W(case 5: /* DeviceFeaturesSel (W) */ \
             vgpu->DeviceFeaturesSel = value; return true;) \
         W(case 8: /* DriverFeatures (W) */ \
-            vgpu->DriverFeaturesSel == 0 ? (vgpu->DriverFeatures = value) : 0; return true;) \
+            vgpu->DriverFeaturesSel < ARRAY_SIZE(virtiogpu_features) && !(value & ~virtiogpu_features[vgpu->DriverFeaturesSel]) ? \
+                (vgpu->DriverFeatures[vgpu->DriverFeaturesSel] = value) : virtiogpu_set_fail(vgpu); return true;) \
         W(case 9: /* DriverFeaturesSel (W) */ \
             vgpu->DriverFeaturesSel = value; return true;) \
         \
         W(case 12: /* QueueSel (W) */ \
-            if (value < (sizeof(vgpu->queues) / sizeof(*(vgpu->queues)))) \
+            if (value < ARRAY_SIZE(vgpu->queues)) \
                 vgpu->QueueSel = value; \
             else \
                 virtiogpu_set_fail(vgpu); \
@@ -1229,7 +1230,7 @@ void virtiogpu_cb_write_fence(void *cookie, uint32_t fence) {
             if (value) virtiogpu_set_fail(vgpu); return true;) \
         \
         W(case 20: /* QueueNotify (W) */ \
-            if (value < (sizeof(vgpu->queues) / sizeof(*(vgpu->queues)))) \
+            if (value < ARRAY_SIZE(vgpu->queues)) \
                 virtiogpu_notify_queue(vgpu, value); \
             else \
                 virtiogpu_set_fail(vgpu); \
@@ -1290,6 +1291,289 @@ REG_FUNCTIONS(bool virtiogpu_reg, (virtiogpu_state_t *vgpu, uint32_t addr), uint
     }
 
 REG_FUNCTIONS(void virtiogpu_wrap_mem, (core_t *core, virtiogpu_state_t *vgpu, uint32_t addr, uint8_t width), uint32_t, __virtiogpu_wrap_body)
+
+
+// VIRTIO-INPUT
+
+typedef struct {
+    uint32_t QueueNum;
+    uint32_t QueueDesc;
+    uint32_t QueueAvail;
+    uint32_t QueueUsed;
+    uint16_t last_avail;
+    bool ready;
+} virtioinput_queue_t;
+
+const uint32_t virtioinput_features [] = {
+    0,
+    1, // VIRTIO_F_VERSION_1
+};
+
+typedef struct {
+    // feature negotiation
+    uint32_t DeviceFeaturesSel;
+    uint32_t DriverFeatures [ARRAY_SIZE(virtioinput_features)];
+    uint32_t DriverFeaturesSel;
+    // queue config
+    uint32_t QueueSel;
+    virtioinput_queue_t queues [2];
+    // status
+    uint32_t Status;
+    uint32_t InterruptStatus;
+    // device-specific config
+    struct virtio_input_config config_area;
+    // supplied by environment
+    uint32_t* ram;
+    void *cookie;
+} virtioinput_state_t;
+
+#define __VINPUT_QUEUE_NUM_MAX 1024
+#define __VINPUT_QUEUE (vinput->queues[vinput->QueueSel])
+
+#define __VINPUT_PREPROCESS_ADDR(addr) ((addr) < RAM_SIZE && !((addr) & 0b11) ? ((addr) >> 2) : (virtioinput_set_fail(vinput), 0))
+
+void virtioinput_set_fail(virtioinput_state_t* vinput) {
+    fprintf(stderr, "[VINPUT] device fail\n");
+    vinput->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
+    if (vinput->Status & VIRTIO_STATUS__DRIVER_OK)
+        vinput->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+}
+
+void virtioinput_update_status(virtioinput_state_t* vinput, uint32_t status) {
+    if ((status & VIRTIO_STATUS__FEATURES_OK) && !(vinput->DriverFeatures[1] & 1)) {
+        fprintf(stderr, "[VINPUT] version 1 feature flag not accepted, failing\n");
+        virtioinput_set_fail(vinput);
+        return;
+    }
+    vinput->Status |= status;
+    if (!status) { // reset
+        memset(vinput, 0, offsetof(virtioinput_state_t, ram));
+    }
+    fprintf(stderr, "[VINPUT] status: %s\n", virtio_status_to_string(vinput->Status));
+}
+
+bool virtioinput_process_buffer_eventq(virtioinput_state_t* vinput, struct virtio_input_event *cmd) {
+    return false; // TODO
+}
+
+bool virtioinput_process_buffer_statusq(virtioinput_state_t* /*vinput*/, const struct virtio_input_event *cmd) {
+    fprintf(stderr, "[VINPUT] status event: %u, %u, %u\n", cmd->type, cmd->code, cmd->value);
+    return true;
+}
+
+#define __vinput_assert_cond(COND, MESSAGE) \
+    if (!(COND)) { \
+        fprintf(stderr, "[VINPUT] " MESSAGE ", failing\n"); \
+        virtioinput_set_fail(vinput); \
+        return; \
+    }
+
+#define __VINPUT_GENERATE_QUEUE_HANDLER(NAME_SUFFIX, QUEUE_IDX, WRITABLE) \
+    void __virtioinput_try_##NAME_SUFFIX(virtioinput_state_t* vinput) { \
+        uint32_t* ram = vinput->ram; \
+        virtioinput_queue_t* queue = &vinput->queues[QUEUE_IDX]; \
+        if ((vinput->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)) \
+            return; \
+        if (!( (vinput->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready )) \
+            return virtioinput_set_fail(vinput); \
+        \
+        /* check for new buffers */ \
+        uint16_t new_avail = ram[queue->QueueAvail] >> 16; \
+        if (new_avail - queue->last_avail > (uint16_t)queue->QueueNum) \
+            return (fprintf(stderr, "size check fail\n"), virtioinput_set_fail(vinput)); \
+        if (queue->last_avail == new_avail) \
+            return; \
+        \
+        /* process them */ \
+        uint16_t new_used = ram[queue->QueueUsed] >> 16; \
+        while (queue->last_avail != new_avail) { \
+            uint16_t queue_idx = queue->last_avail % queue->QueueNum; \
+            uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >> (16 * (queue_idx % 2)); \
+            __vinput_assert_cond(buffer_idx < queue->QueueNum, "descriptor bad addr"); \
+            const struct virtq_desc *desc = (struct virtq_desc*) &ram[queue->QueueDesc + buffer_idx * 4]; \
+            __vinput_assert_cond(!(desc->flags & VIRTQ_DESC_F_NEXT), "unexpected extra descriptor"); \
+            __vinput_assert_cond(!!(desc->flags & VIRTQ_DESC_F_WRITE) == (WRITABLE), "descriptor [not] writable"); \
+            __vinput_assert_cond(desc->len >= sizeof(struct virtio_input_event), "descriptor [not] writable"); \
+            struct virtio_input_event *cmd = (struct virtio_input_event *) &vinput->ram[__VINPUT_PREPROCESS_ADDR(desc->addr)]; \
+            if (!virtioinput_process_buffer_##NAME_SUFFIX(vinput, cmd)) break; \
+            /* consume from available queue, write to used queue */ \
+            queue->last_avail++; \
+            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] = buffer_idx; \
+            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = sizeof(struct virtio_input_event); \
+            new_used++; \
+        } \
+        vinput->ram[queue->QueueUsed] &= MASK(16); \
+        vinput->ram[queue->QueueUsed] |= ((uint32_t)new_used) << 16; \
+        \
+        /* send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */ \
+        if (!(ram[queue->QueueAvail] & 1)) \
+            vinput->InterruptStatus |= VIRTIO_INT__USED_RING; \
+    }
+
+__VINPUT_GENERATE_QUEUE_HANDLER(eventq, __VINPUT_QUEUE_EVENT, true)
+__VINPUT_GENERATE_QUEUE_HANDLER(statusq, __VINPUT_QUEUE_STATUS, false)
+
+void virtioinput_notify_queue(virtioinput_state_t* vinput, uint32_t queueIdx) {
+    switch (queueIdx) {
+        case __VINPUT_QUEUE_EVENT: return __virtioinput_try_eventq(vinput);
+        case __VINPUT_QUEUE_STATUS: return __virtioinput_try_statusq(vinput);
+    }
+}
+
+#define __virtioinput_body(R, W) \
+    switch (addr) { \
+        R(case 0: /* MagicValue (R) */ \
+            *value = __VIRTIO_MAGIC; return true;) \
+        R(case 1: /* Version (R) */ \
+            *value = 2; return true;) \
+        R(case 2: /* DeviceID (R) */ \
+            *value = __VIRTIO_ID_INPUT; return true;) \
+        R(case 3: /* VendorID (R) */ \
+            *value = VIRTIO_VENDOR_ID; return true;) \
+        \
+        R(case 4: /* DeviceFeatures (R) */ \
+            *value = vinput->DeviceFeaturesSel < ARRAY_SIZE(virtioinput_features) ? virtioinput_features[vinput->DeviceFeaturesSel] : 0; return true;) \
+        W(case 5: /* DeviceFeaturesSel (W) */ \
+            vinput->DeviceFeaturesSel = value; return true;) \
+        W(case 8: /* DriverFeatures (W) */ \
+            vinput->DriverFeaturesSel < ARRAY_SIZE(virtioinput_features) && !(value & ~virtioinput_features[vinput->DriverFeaturesSel]) ? \
+                (vinput->DriverFeatures[vinput->DriverFeaturesSel] = value) : virtioinput_set_fail(vinput); return true;) \
+        W(case 9: /* DriverFeaturesSel (W) */ \
+            vinput->DriverFeaturesSel = value; return true;) \
+        \
+        W(case 12: /* QueueSel (W) */ \
+            if (value < ARRAY_SIZE(vinput->queues)) \
+                vinput->QueueSel = value; \
+            else \
+                virtioinput_set_fail(vinput); \
+            return true;) \
+        R(case 13: /* QueueNumMax (R) */ \
+            *value = __VINPUT_QUEUE_NUM_MAX; return true;) \
+        W(case 14: /* QueueNum (W) */ \
+            if (value > 0 && value <= __VINPUT_QUEUE_NUM_MAX) \
+                __VINPUT_QUEUE.QueueNum = value; \
+            else \
+                virtioinput_set_fail(vinput); \
+            return true;) \
+        case 17: /* QueueReady (RW) */ \
+            R(*value = __VINPUT_QUEUE.ready ? 1 : 0;) \
+            W(__VINPUT_QUEUE.ready = value & 1;) \
+            W( \
+                if (value & 1) \
+                    __VINPUT_QUEUE.last_avail = vinput->ram[__VINPUT_QUEUE.QueueAvail] >> 16; \
+            ) \
+            return true; \
+        W(case 32: /* QueueDescLow (W) */ \
+            __VINPUT_QUEUE.QueueDesc = __VINPUT_PREPROCESS_ADDR(value); return true;) \
+        W(case 33: /* QueueDescHigh (W) */ \
+            if (value) virtioinput_set_fail(vinput); return true;) \
+        W(case 36: /* QueueAvailLow (W) */ \
+            __VINPUT_QUEUE.QueueAvail = __VINPUT_PREPROCESS_ADDR(value); return true;) \
+        W(case 37: /* QueueAvailHigh (W) */ \
+            if (value) virtioinput_set_fail(vinput); return true;) \
+        W(case 40: /* QueueUsedLow (W) */ \
+            __VINPUT_QUEUE.QueueUsed = __VINPUT_PREPROCESS_ADDR(value); return true;) \
+        W(case 41: /* QueueUsedHigh (W) */ \
+            if (value) virtioinput_set_fail(vinput); return true;) \
+        \
+        W(case 20: /* QueueNotify (W) */ \
+            if (value < ARRAY_SIZE(vinput->queues)) \
+                virtioinput_notify_queue(vinput, value); \
+            else \
+                virtioinput_set_fail(vinput); \
+            return true;) \
+        R(case 24: /* InterruptStatus (R) */ \
+            *value = vinput->InterruptStatus; return true;) \
+        W(case 25: /* InterruptACK (W) */ \
+            vinput->InterruptStatus &= ~value; return true;) \
+        case 28: /* Status (RW) */ \
+            R(*value = vinput->Status;) \
+            W(virtioinput_update_status(vinput, value);) \
+            return true; \
+        \
+        R(case 63: /* ConfigGeneration (R) */ \
+            *value = 0; return true;) \
+        default: return false; \
+    }
+
+REG_FUNCTIONS(bool virtioinput_reg, (virtioinput_state_t *vinput, uint32_t addr), uint32_t, __virtioinput_body)
+
+void virtioinput_update_config_area(virtioinput_state_t *vinput) {
+    struct virtio_input_config *ca = &vinput->config_area;
+    if (ca->select == VIRTIO_INPUT_CFG_ID_NAME && !ca->subsel) {
+        const char* name = "Virtual console events";
+        ca->size = strlen(name);
+        memcpy(ca->u.string, name, ca->size);
+    } else {
+        ca->size = 0;
+    }
+}
+
+#define __VIRTIOINPUT_MEM_CASE(FUNC, TYPE, CODE) \
+    case (FUNC): \
+    if (unlikely((addr & ((sizeof(TYPE)) - 1)))) { \
+        core_set_exception(core, exc_cause, core->exc_val); \
+        return; \
+    } \
+    { TYPE x; CODE }; break;
+
+#define __VIRTIOINPUT_MEM_CASE_R(FUNC, TYPE) \
+    __VIRTIOINPUT_MEM_CASE(FUNC, TYPE, \
+        memcpy(&x, ((char*)&vinput->config_area) + addr, sizeof(TYPE)); *value = x;)
+
+#define __VIRTIOINPUT_MEM_CASE_W(FUNC, TYPE) \
+    __VIRTIOINPUT_MEM_CASE(FUNC, TYPE, \
+        x = value; memcpy(((char*)&vinput->config_area) + addr, &x, sizeof(TYPE));)
+
+#define __virtioinput_config_mem_body(R, W) \
+    if (addr >= sizeof(vinput->config_area)) { \
+        core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val); \
+        return; \
+    } \
+    const uint32_t exc_cause = R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN); \
+    switch (width) { \
+    R( \
+        __VIRTIOINPUT_MEM_CASE_R(RISCV_MEM_LW,  uint32_t) \
+        __VIRTIOINPUT_MEM_CASE_R(RISCV_MEM_LHU, uint16_t) \
+        __VIRTIOINPUT_MEM_CASE_R(RISCV_MEM_LH,  int16_t) \
+        __VIRTIOINPUT_MEM_CASE_R(RISCV_MEM_LBU, uint8_t) \
+        __VIRTIOINPUT_MEM_CASE_R(RISCV_MEM_LB,  int8_t) \
+    ) \
+    W( \
+        __VIRTIOINPUT_MEM_CASE_W(RISCV_MEM_SW,  uint32_t) \
+        __VIRTIOINPUT_MEM_CASE_W(RISCV_MEM_SH,  uint16_t) \
+        __VIRTIOINPUT_MEM_CASE_W(RISCV_MEM_SB,  uint8_t) \
+    ) \
+        default: \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
+            return; \
+    } \
+    W(virtioinput_update_config_area(vinput);)
+
+REG_FUNCTIONS(void __virtioinput_config_mem, (core_t *core, virtioinput_state_t *vinput, uint32_t addr, uint8_t width), uint32_t, __virtioinput_config_mem_body)
+
+// we still need a wrapper for memory accesses
+#define __virtioinput_wrap_body(R, W) \
+    if (addr >= 64*4) { REG_FUNC(R, W, __virtioinput_config_mem)(core, vinput, addr - 64*4, width, value); return; } \
+    switch (width) { \
+        case R(RISCV_MEM_LW) W(RISCV_MEM_SW): \
+            if (!REG_FUNC(R, W, virtioinput_reg)(vinput, addr >> 2, value)) \
+                core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val); \
+            break; \
+        R(case RISCV_MEM_LBU:) \
+        R(case RISCV_MEM_LB:) \
+        R(case RISCV_MEM_LHU:) \
+        R(case RISCV_MEM_LH:) \
+        W(case RISCV_MEM_SB:) \
+        W(case RISCV_MEM_SH:) \
+            core_set_exception(core, R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_MISALIGN), core->exc_val); \
+            return; \
+        default: \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
+            return; \
+    }
+
+REG_FUNCTIONS(void virtioinput_wrap_mem, (core_t *core, virtioinput_state_t *vinput, uint32_t addr, uint8_t width), uint32_t, __virtioinput_wrap_body)
 
 #endif
 
@@ -1376,6 +1660,8 @@ REG_FUNCTIONS(void plic_wrap_mem, (core_t *core, plic_state_t *plic, uint32_t ad
 #define IRQ_VNET_BIT (1 << IRQ_VNET)
 #define IRQ_VGPU 3
 #define IRQ_VGPU_BIT (1 << IRQ_VGPU)
+#define IRQ_VINPUT 4
+#define IRQ_VINPUT_BIT (1 << IRQ_VINPUT)
 
 // keep queue capacity over number of items here
 typedef enum {
@@ -1385,6 +1671,7 @@ typedef enum {
     IO_EVENT_VNET_TX,
     IO_EVENT_VGPU,
     IO_EVENT_VGPU_NEW_SCANOUT_SIZE,
+    IO_EVENT_VINPUT,
 } io_event_t;
 
 typedef struct {
@@ -1396,6 +1683,7 @@ typedef struct {
 #ifdef USE_VIRGLRENDERER
     console_t* console;
     virtiogpu_state_t gpu;
+    virtioinput_state_t vinput;
 #endif
     int virglrenderer_fd;
     uint64_t time_offset;
@@ -1457,11 +1745,21 @@ void emulator_update_vgpu_interrupts(core_t* core) {
     plic_update_interrupts(core, &data->plic);
 }
 
+void emulator_update_vinput_interrupts(core_t* core) {
+    emu_state_t *data = (emu_state_t *)core->user_data;
+    data->vinput.InterruptStatus ? (data->plic.active |= IRQ_VINPUT_BIT) : (data->plic.active &= ~IRQ_VINPUT_BIT);
+    plic_update_interrupts(core, &data->plic);
+}
+
 #define __VGPU_MEM_BODY(R, W) \
             case 0x42: /* VIRTIO-GPU */ \
                 REG_FUNC(R, W, virtiogpu_wrap_mem)(core, &data->gpu, addr & 0xFFFFF, width, value); \
                 virgl_renderer_poll(); \
                 emulator_update_vgpu_interrupts(core); \
+                return; \
+            case 0x43: /* VIRTIO-INPUT */ \
+                REG_FUNC(R, W, virtioinput_wrap_mem)(core, &data->vinput, addr & 0xFFFFF, width, value); \
+                emulator_update_vinput_interrupts(core); \
                 return;
 #else
 #define __VGPU_MEM_BODY(R, W)
@@ -1886,6 +2184,8 @@ int main() {
     data.virglrenderer_fd = data.gpu.virglrenderer_fd;
     virtiogpu_init_scanout(&data.gpu);
     console_get_scanout_size(data.console, &data.gpu.scanout_size);
+    data.vinput.ram = data.ram;
+    data.vinput.cookie = &data;
 #endif
 
     // start I/O thread
