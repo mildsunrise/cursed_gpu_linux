@@ -1,3 +1,5 @@
+#pragma once
+
 // VIRTQUEUE
 
 /* An interface for efficient virtio implementation.

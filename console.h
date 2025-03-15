@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "virtio_constants.h"
 
 typedef struct console_t console_t;
 
@@ -34,6 +35,20 @@ void console_set_stop_cb(console_t* con, console_stop_cb cb);
 // and when fired, it won't fire again until console_get_scanout_size() is called.
 typedef void(*console_new_scanout_size_cb)(void* data);
 void console_set_new_scanout_size_cb(console_t* con, console_new_scanout_size_cb cb);
+
+// called from console_poll() or console_listen_input_events() when one or more
+// input events are pending to be retrieved through console_get_input_event()
+// and/or marked read by calling console_finish_input_event_read().
+//
+// this won't fire before console_listen_input_events()'s first call,
+// and when fired, it won't fire again until console_listen_input_events() is called.
+typedef void(*console_pending_input_events_cb)(void* data);
+void console_set_pending_input_events_cb(console_t* con, console_pending_input_events_cb cb);
+
+// request the pending_input_events callback to fire whenever its condition holds
+// (see console_set_pending_input_events_cb). if the condition already holds when
+// this method is called, the callback will fire synchronously as part of the call.
+void console_listen_input_events(console_t* con);
 
 // to be called from emulation thread
 // ----------------------------------
@@ -76,3 +91,15 @@ typedef struct {
 } console_scanout_flush_t;
 
 void console_update_scanout(console_t* con, /* no transfer */ console_scanout_flush_t* sc);
+
+// check amount of available input events to read
+uint8_t console_get_input_event_count(console_t* con);
+
+// fetch the next input event. note: calling this method when there
+// are no events to read (as signaled by console_get_input_event_count)
+// is undefined behavior
+struct virtio_input_event console_get_input_event(console_t* con);
+
+// mark all input events fetched through console_get_input_event as read,
+// freeing up their space in the queue
+void console_finish_input_event_read(console_t* con);

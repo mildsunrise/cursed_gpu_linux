@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "console.h"
 
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include <stdatomic.h>
 #include <wayland-client.h>
 #include <wayland-egl.h>
+#include <linux/input-event-codes.h>
 #include "wl_protocols/stable/xdg-shell/xdg-shell.h"
 #include "wl_protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.h"
 #include "wl_protocols/stable/viewporter/viewporter.h"
@@ -31,66 +33,75 @@
 
 #define ARRAY_SIZE(x) ((sizeof x) / (sizeof *x))
 
-// SPSC circular queue, with separate write/commit steps
+// SPSC circular queue, with separate write/commit and read/commit steps
 
 typedef struct {
     // the write head (atomic + local writer copy)
     _Atomic uint8_t write_head_at;
     uint8_t write_head;
-    // the read head (local reader)
+    // the read head (atomic + local reader copy)
+    _Atomic uint8_t read_head_at;
     uint8_t read_head;
-    // an eventfd (written to by writer, after each commit to the atomic)
-    int eventfd;
     // elements buffer (shared)
-    uint8_t buffer [16];
+    struct virtio_input_event buffer [64];
 } spsc_queue_t;
 
 static void spsc_queue_init(spsc_queue_t *queue) {
     memset(queue, 0, sizeof(*queue));
-    queue->eventfd = eventfd(0, 0);
-    assert(queue->eventfd >= 0);
     atomic_init(&queue->write_head_at, 0);
     assert(atomic_is_lock_free(&queue->write_head_at));
+    atomic_init(&queue->read_head_at, 0);
+    assert(atomic_is_lock_free(&queue->read_head_at));
+}
+
+// check amount of items available for write
+static uint8_t spsc_queue_write_capacity(spsc_queue_t *queue) {
+    uint8_t other_head = atomic_load_explicit(&queue->read_head_at, memory_order_acquire);
+    uint8_t our_head = queue->write_head;
+    return ((our_head < other_head ? 0 : ARRAY_SIZE(queue->buffer)) + other_head - our_head) - 1;
 }
 
 // writes an item to the queue
 //
 // warning: there are NO CHECKS for overflows, caller is responsible
-// to make sure not to write more elements than queue capacity
-// (sizeof(queue->buffer) / sizeof(*queue->buffer) - 1)
-static void spsc_queue_write(spsc_queue_t *queue, uint8_t value) {
-    queue->buffer[queue->write_head] = value;
+// not to write more elements than what spsc_queue_write_capacity() returned.
+static void spsc_queue_write(spsc_queue_t *queue, struct virtio_input_event event) {
+    queue->buffer[queue->write_head] = event;
     queue->write_head++;
-    if (queue->write_head == sizeof(queue->buffer) / sizeof(*queue->buffer))
+    if (queue->write_head == ARRAY_SIZE(queue->buffer))
         queue->write_head = 0;
 }
 
 // makes the written items visible to the reader end
-static void spsc_queue_commit(spsc_queue_t *queue) {
+static void spsc_queue_commit_write(spsc_queue_t *queue) {
     atomic_store_explicit(&queue->write_head_at, queue->write_head, memory_order_release);
-
-    uint64_t wake_value = 1;
-    int ret = write(queue->eventfd, &wake_value, sizeof(wake_value));
-    assert(ret == sizeof(wake_value));
 }
 
-// reads all pending items from the queue, returning true if there were items to read
-static bool spsc_queue_read_all(spsc_queue_t *queue, void (*cb)(uint8_t value, void *cookie), void *cookie) {
-    uint8_t head = atomic_load_explicit(&queue->write_head_at, memory_order_relaxed);
-    if (likely(queue->read_head == head))
-        return false;
-    atomic_thread_fence(memory_order_acquire);
+// check amount of items available for read
+static uint8_t spsc_queue_read_capacity(spsc_queue_t *queue) {
+    uint8_t other_head = atomic_load_explicit(&queue->write_head_at, memory_order_acquire);
+    uint8_t our_head = queue->read_head;
+    return (our_head < other_head ? 0 : ARRAY_SIZE(queue->buffer)) + other_head - our_head;
+}
 
-    while (queue->read_head != head) {
-        cb(queue->buffer[queue->read_head], cookie);
-        queue->read_head++;
-        if (queue->read_head == sizeof(queue->buffer) / sizeof(*queue->buffer))
-            queue->read_head = 0;
-    }
-    return true;
+// read an item from the queue
+//
+// warning: there are NO CHECKS for overflows, caller is responsible
+// not to read more elements than what spsc_queue_read_capacity() returned.
+static void spsc_queue_read(spsc_queue_t *queue, struct virtio_input_event* event) {
+    *event = queue->buffer[queue->read_head];
+    queue->read_head++;
+    if (queue->read_head == ARRAY_SIZE(queue->buffer))
+        queue->read_head = 0;
+}
+
+// makes the read items visible on the writer end (elements should no longer be accessed after this call)
+static void spsc_queue_commit_read(spsc_queue_t *queue) {
+    atomic_store_explicit(&queue->read_head_at, queue->read_head, memory_order_release);
 }
 
 struct console_buffer_t {
+    // FIXME: initialize the atomics...
     _Atomic uint8_t nrefs;
     bool is_bound;
     GLuint tex_id;
@@ -122,11 +133,13 @@ static const window_state_t INITIAL_WINDOW_STATE = {
 };
 
 typedef struct {
+    // FIXME: initialize the atomics...
     _Atomic uint8_t nrefs;
     console_scanout_flush_t flush;
 } flush_request_t;
 
 typedef struct {
+    // FIXME: initialize the atomics...
     _Atomic uint8_t nrefs;
     console_scanout_size_t ssize;
 } scanout_size_request_t;
@@ -138,6 +151,7 @@ typedef struct {
     MACRO(wl_fractional_scale_manager, wp_fractional_scale_manager_v1, 1) \
     MACRO(wl_compositor, wl_compositor, 4)
 
+// FIXME: initialize the atomics...
 struct console_t {
     int poll_fd;
     int event_fd;
@@ -146,6 +160,7 @@ struct console_t {
     void* cb_data;
     console_new_scanout_size_cb cb_new_scanout_size;
     console_stop_cb cb_stop;
+    console_pending_input_events_cb cb_pending_input_events;
 
     // pools to avoid frequent malloc
     console_buffer_t bufs [4];
@@ -156,6 +171,11 @@ struct console_t {
     console_scanout_flush_t current_flush;
     console_scanout_size_t scanout_size;
     _Atomic (scanout_size_request_t*) pending_scanout_size;
+    bool listening_for_input_events;
+    bool in_input_dropout;
+    spsc_queue_t input_event_queue;
+    // maps normalized surface-local coordinates to normalized scanout coordinates
+    GLfloat input_mat [3*2];
 
     EGLDisplay egl_display;
     EGLContext egl_context;
@@ -171,6 +191,9 @@ struct console_t {
 
     struct wl_display* wl_display;
     struct wl_registry* wl_registry;
+    uint32_t wl_seat_name;
+    struct wl_seat* wl_seat;
+    struct wl_keyboard* wl_keyboard;
 #define WL_DECLARE_GLOBAL(NAME, INTERFACE, VERSION) \
     struct INTERFACE* NAME; \
     uint32_t __##NAME##_name;
@@ -303,9 +326,121 @@ void console_set_new_scanout_size_cb(console_t* con, console_new_scanout_size_cb
     con->cb_new_scanout_size = cb;
 }
 
+void console_set_pending_input_events_cb(console_t* con, console_pending_input_events_cb cb) {
+    con->cb_pending_input_events = cb;
+}
+
 // WAYLAND SET UP
 
 static void draw_frame(console_t* con);
+static bool reserve_input_event_frame(console_t* con, size_t n_events);
+static void finish_input_event_frame(console_t* con);
+
+static void wl_keyboard_keymap(
+    void */*__data*/,
+    struct wl_keyboard */*wl_keyboard*/,
+    uint32_t /*format*/,
+    int32_t /*fd*/,
+    uint32_t /*size*/
+) {}
+
+static void wl_keyboard_enter(
+    void */*__data*/,
+    struct wl_keyboard */*wl_keyboard*/,
+    uint32_t /*serial*/,
+    struct wl_surface */*surface*/,
+    struct wl_array */*keys*/
+) {
+    //console_t* con = (console_t*) __data;
+}
+
+static void wl_keyboard_leave(
+    void */*__data*/,
+    struct wl_keyboard */*wl_keyboard*/,
+    uint32_t /*serial*/,
+    struct wl_surface */*surface*/
+) {
+    //console_t* con = (console_t*) __data;
+    // TODO: release all keys
+}
+
+static void wl_keyboard_key(
+    void *__data,
+    struct wl_keyboard */*wl_keyboard*/,
+    uint32_t /*serial*/,
+    uint32_t /*time*/,
+    uint32_t key,
+    uint32_t state
+) {
+    console_t* con = (console_t*) __data;
+    struct virtio_input_event event = {
+        .type = EV_KEY,
+        .code = key,
+    };
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        event.value = 1;
+    else if (state == WL_KEYBOARD_KEY_STATE_RELEASED)
+        event.value = 0;
+    else
+        return;
+    if (reserve_input_event_frame(con, 1)) {
+        spsc_queue_write(&con->input_event_queue, event);
+        finish_input_event_frame(con);
+    }
+}
+
+static void wl_keyboard_modifiers(
+    void */*__data*/,
+    struct wl_keyboard */*wl_keyboard*/,
+    uint32_t /*serial*/,
+    uint32_t /*mods_depressed*/,
+    uint32_t /*mods_latched*/,
+    uint32_t /*mods_locked*/,
+    uint32_t /*group*/
+) {
+    //console_t* con = (console_t*) __data;
+}
+
+static void wl_keyboard_repeat_info(
+    void */*__data*/,
+    struct wl_keyboard */*wl_keyboard*/,
+    int32_t /*rate*/,
+    int32_t /*delay*/
+) {
+    //console_t* con = (console_t*) __data;
+}
+
+static const struct wl_keyboard_listener wl_keyboard_listener = {
+    .keymap = wl_keyboard_keymap,
+    .enter = wl_keyboard_enter,
+    .leave = wl_keyboard_leave,
+    .key = wl_keyboard_key,
+    .modifiers = wl_keyboard_modifiers,
+    .repeat_info = wl_keyboard_repeat_info,
+};
+
+static void wl_seat_name(void * /*__data*/, struct wl_seat */*wl_seat*/, const char* name) {
+    fprintf(stderr, "Using seat: %s\n", name);
+}
+
+static void wl_seat_capabilities(void * __data, struct wl_seat *wl_seat, uint32_t capabilities) {
+    console_t* con = (console_t*) __data;
+    if (!!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != !!con->wl_keyboard) {
+        if (con->wl_keyboard) {
+            wl_keyboard_release(con->wl_keyboard);
+            con->wl_keyboard = NULL;
+        } else {
+            con->wl_keyboard = wl_seat_get_keyboard(wl_seat);
+            assert(con->wl_keyboard);
+            wl_keyboard_add_listener(con->wl_keyboard, &wl_keyboard_listener, con);
+        }
+    }
+}
+
+static const struct wl_seat_listener wl_seat_listener = {
+    .name = wl_seat_name,
+    .capabilities = wl_seat_capabilities,
+};
 
 static void registry_global(
     void *__data,
@@ -315,6 +450,22 @@ static void registry_global(
     uint32_t /*version*/
 ) {
     console_t* con = (console_t*) __data;
+
+    // wl_seat binding is special; we allow it after the initial burst,
+    // we tolerate duplicate bindings, we attach a listener right after binding,
+    // and new bindings replace our usage of old ones
+    if (strcmp(interface, wl_seat_interface.name) == 0) {
+        if (con->wl_seat) {
+            wl_seat_capabilities(con, con->wl_seat, 0);
+            wl_seat_release(con->wl_seat);
+            con->wl_seat = NULL;
+        }
+        con->wl_seat = wl_registry_bind(wl_registry, name, &wl_seat_interface, 5);
+        assert(con->wl_seat);
+        con->wl_seat_name = name;
+        wl_seat_add_listener(con->wl_seat, &wl_seat_listener, con);
+    }
+
     if (con->registry_enum_done) return;
 #define WL_BIND_GLOBAL(NAME, INTERFACE, VERSION) \
     if (strcmp(interface, (INTERFACE##_interface).name) == 0) { \
@@ -337,6 +488,13 @@ static void registry_global_remove(
     uint32_t name
 ) {
     console_t* con = (console_t*) __data;
+
+    if (con->wl_seat && name == con->wl_seat_name) {
+        wl_seat_capabilities(con, con->wl_seat, 0);
+        wl_seat_release(con->wl_seat);
+        con->wl_seat = NULL;
+    }
+
 #define WL_UNBIND_GLOBAL(NAME, INTERFACE, VERSION) \
     if (name == con->__##NAME##_name && con->NAME) { \
         fprintf(stderr, "compositor tried to remove global " #INTERFACE " of name=%u\n", name); \
@@ -486,6 +644,7 @@ static const int32_t MIN_SIZE [2] = { 100, 100 };
 static const int32_t INITIAL_SIZE [2] = { 800, 600 };
 
 static void init_wayland(console_t* con) {
+    spsc_queue_init(&con->input_event_queue);
     con->configuring_state = INITIAL_WINDOW_STATE;
 
     con->wl_registry = wl_display_get_registry(con->wl_display);
@@ -865,6 +1024,17 @@ static void poll_eventfd(console_t* con, uint64_t /*n*/) {
 
 static void set_scanout_size(console_t* con, uint32_t width, uint32_t height);
 
+static void set_input_mat(console_t* con, GLfloat model_mat [3*2]) {
+    // invert the affine transform
+    GLfloat det = model_mat[0] * model_mat[3+1] - model_mat[1] * model_mat[3];
+    con->input_mat[0+0] = +model_mat[3+1] / det;
+    con->input_mat[0+1] = -model_mat[3+0] / det;
+    con->input_mat[3+0] = -model_mat[0+1] / det;
+    con->input_mat[3+1] = +model_mat[0+0] / det;
+    con->input_mat[0+2] = -(model_mat[0+2] * con->input_mat[0+0] + model_mat[3+2] * con->input_mat[0+1]);
+    con->input_mat[3+2] = -(model_mat[0+2] * con->input_mat[3+0] + model_mat[3+2] * con->input_mat[3+1]);
+}
+
 static void draw_frame(console_t* con) {
     console_scanout_flush_t* sc = &con->current_flush;
     window_state_t* st = &con->configured_state;
@@ -930,6 +1100,7 @@ static void draw_frame(console_t* con) {
     model_mat[4] = sc->viewport.h * scale / h;
     model_mat[2] = (1 - model_mat[0]) / 2;
     model_mat[5] = (1 - model_mat[4]) / 2;
+    set_input_mat(con, model_mat);
     for (size_t i = 0; i < 3; i++) model_mat[3+i] *= -1;
     model_mat[3+2] += 1;
 
@@ -982,4 +1153,62 @@ void console_get_scanout_size(console_t* con, console_scanout_size_t *ssize) {
     assert(req);
     *ssize = req->ssize;
     free_ssize_request(con, req);
+}
+
+// input event thread sync + evdev frame layer
+
+void console_listen_input_events(console_t* con) {
+    con->listening_for_input_events = true;
+    if (spsc_queue_write_capacity(&con->input_event_queue) != ARRAY_SIZE(con->input_event_queue.buffer) - 1) {
+        con->cb_pending_input_events(con->cb_data);
+        con->listening_for_input_events = false;
+    }
+}
+
+static bool reserve_input_event_frame(console_t* con, size_t n_events) {
+    n_events++; // final SYN_REPORT
+    n_events++; // always leave one slot free in case we have to send a SYN_DROPPED below
+
+    assert(n_events <= ARRAY_SIZE(con->input_event_queue.buffer) - 1);
+    uint8_t capacity = spsc_queue_write_capacity(&con->input_event_queue);
+    if (capacity >= n_events) {
+        con->in_input_dropout = false;
+        return true;
+    }
+
+    // no capacity, send a SYN_DROPPED and tell caller to drop the frame
+    if (!con->in_input_dropout) {
+        assert(capacity >= 1);
+        con->in_input_dropout = true;
+        finish_input_event_frame(con);
+    }
+    return false;
+}
+
+static void finish_input_event_frame(console_t* con) {
+    spsc_queue_write(&con->input_event_queue, (struct virtio_input_event) {
+        .type = EV_SYN,
+        .code = con->in_input_dropout ? SYN_DROPPED : SYN_REPORT,
+        .value = 0,
+    });
+
+    spsc_queue_commit_write(&con->input_event_queue);
+    if (con->listening_for_input_events) {
+        con->cb_pending_input_events(con->cb_data);
+        con->listening_for_input_events = false;
+    }
+}
+
+uint8_t console_get_input_event_count(console_t* con) {
+    return spsc_queue_read_capacity(&con->input_event_queue);
+}
+
+struct virtio_input_event console_get_input_event(console_t* con) {
+    struct virtio_input_event event;
+    spsc_queue_read(&con->input_event_queue, &event);
+    return event;
+}
+
+void console_finish_input_event_read(console_t* con) {
+    spsc_queue_commit_read(&con->input_event_queue);
 }

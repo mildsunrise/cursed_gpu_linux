@@ -35,7 +35,7 @@ core.o: core.c core.h riscv_constants.h
 	$(CC) $(CFLAGS) -c $< -o $@
 emulator.o: emulator.c core.h measure.c reg_macros.h riscv_constants.h virtio_constants.h linux_dtb
 	$(CC) $(CFLAGS) -c $< -o $@
-console.o: console.c $(WL_PROTOCOLS_CHDRS) shaders/*.glsl
+console.o: console.c $(WL_PROTOCOLS_CHDRS) shaders/*.glsl virtio_constants.h
 	$(CC) $(CFLAGS) -c $< -o $@
 emulator: core.o emulator.o console.o $(WL_PROTOCOLS_OBJS)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@

@@ -22,6 +22,7 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <sys/uio.h>
+#include <linux/input-event-codes.h>
 #include "measure.c"
 
 #ifdef USE_VIRGLRENDERER
@@ -90,11 +91,11 @@ static void spsc_queue_init(spsc_queue_t *queue) {
 //
 // warning: there are NO CHECKS for overflows, caller is responsible
 // to make sure not to write more elements than queue capacity
-// (sizeof(queue->buffer) / sizeof(*queue->buffer) - 1)
+// (ARRAY_SIZE(queue->buffer) - 1)
 static void spsc_queue_write(spsc_queue_t *queue, uint8_t value) {
     queue->buffer[queue->write_head] = value;
     queue->write_head++;
-    if (queue->write_head == sizeof(queue->buffer) / sizeof(*queue->buffer))
+    if (queue->write_head == ARRAY_SIZE(queue->buffer))
         queue->write_head = 0;
 }
 
@@ -117,7 +118,7 @@ static bool spsc_queue_read_all(spsc_queue_t *queue, void (*cb)(uint8_t value, v
     while (queue->read_head != head) {
         cb(queue->buffer[queue->read_head], cookie);
         queue->read_head++;
-        if (queue->read_head == sizeof(queue->buffer) / sizeof(*queue->buffer))
+        if (queue->read_head == ARRAY_SIZE(queue->buffer))
             queue->read_head = 0;
     }
     return true;
@@ -1324,7 +1325,10 @@ typedef struct {
     struct virtio_input_config config_area;
     // supplied by environment
     uint32_t* ram;
-    void *cookie;
+    uint8_t main2io_event;
+    spsc_queue_t* main2io;
+    console_t* console;
+    bool events_pending;
 } virtioinput_state_t;
 
 #define __VINPUT_QUEUE_NUM_MAX 1024
@@ -1352,14 +1356,31 @@ void virtioinput_update_status(virtioinput_state_t* vinput, uint32_t status) {
     fprintf(stderr, "[VINPUT] status: %s\n", virtio_status_to_string(vinput->Status));
 }
 
-bool virtioinput_process_buffer_eventq(virtioinput_state_t* vinput, struct virtio_input_event *cmd) {
-    return false; // TODO
+size_t virtioinput_process_buffer_eventq_pre(virtioinput_state_t* vinput) {
+    if (!vinput->events_pending) return 0;
+    return console_get_input_event_count(vinput->console);
 }
 
-bool virtioinput_process_buffer_statusq(virtioinput_state_t* /*vinput*/, const struct virtio_input_event *cmd) {
-    fprintf(stderr, "[VINPUT] status event: %u, %u, %u\n", cmd->type, cmd->code, cmd->value);
-    return true;
+void virtioinput_process_buffer_eventq(virtioinput_state_t* vinput, struct virtio_input_event *cmd) {
+    *cmd = console_get_input_event(vinput->console);
 }
+
+void virtioinput_process_buffer_eventq_post(virtioinput_state_t* vinput, size_t available) {
+    console_finish_input_event_read(vinput->console);
+    if (available == 0 && vinput->events_pending) {
+        vinput->events_pending = false;
+        spsc_queue_write(vinput->main2io, vinput->main2io_event);
+        spsc_queue_commit(vinput->main2io);
+    }
+}
+
+size_t virtioinput_process_buffer_statusq_pre(virtioinput_state_t* /*vinput*/) { return SIZE_MAX; }
+
+void virtioinput_process_buffer_statusq(virtioinput_state_t* /*vinput*/, const struct virtio_input_event *cmd) {
+    fprintf(stderr, "[VINPUT] status event: %u, %u, %u\n", cmd->type, cmd->code, cmd->value);
+}
+
+void virtioinput_process_buffer_statusq_post(virtioinput_state_t* /*vinput*/, size_t /*available*/) {}
 
 #define __vinput_assert_cond(COND, MESSAGE) \
     if (!(COND)) { \
@@ -1376,6 +1397,8 @@ bool virtioinput_process_buffer_statusq(virtioinput_state_t* /*vinput*/, const s
             return; \
         if (!( (vinput->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready )) \
             return virtioinput_set_fail(vinput); \
+        size_t available = virtioinput_process_buffer_##NAME_SUFFIX##_pre(vinput); \
+        if (available == 0) return; \
         \
         /* check for new buffers */ \
         uint16_t new_avail = ram[queue->QueueAvail] >> 16; \
@@ -1386,7 +1409,7 @@ bool virtioinput_process_buffer_statusq(virtioinput_state_t* /*vinput*/, const s
         \
         /* process them */ \
         uint16_t new_used = ram[queue->QueueUsed] >> 16; \
-        while (queue->last_avail != new_avail) { \
+        while (queue->last_avail != new_avail && available > 0) { \
             uint16_t queue_idx = queue->last_avail % queue->QueueNum; \
             uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >> (16 * (queue_idx % 2)); \
             __vinput_assert_cond(buffer_idx < queue->QueueNum, "descriptor bad addr"); \
@@ -1395,9 +1418,9 @@ bool virtioinput_process_buffer_statusq(virtioinput_state_t* /*vinput*/, const s
             __vinput_assert_cond(!!(desc->flags & VIRTQ_DESC_F_WRITE) == (WRITABLE), "descriptor [not] writable"); \
             __vinput_assert_cond(desc->len >= sizeof(struct virtio_input_event), "descriptor [not] writable"); \
             struct virtio_input_event *cmd = (struct virtio_input_event *) &vinput->ram[__VINPUT_PREPROCESS_ADDR(desc->addr)]; \
-            if (!virtioinput_process_buffer_##NAME_SUFFIX(vinput, cmd)) break; \
+            virtioinput_process_buffer_##NAME_SUFFIX(vinput, cmd); \
             /* consume from available queue, write to used queue */ \
-            queue->last_avail++; \
+            queue->last_avail++, available--; \
             ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] = buffer_idx; \
             ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = sizeof(struct virtio_input_event); \
             new_used++; \
@@ -1408,6 +1431,7 @@ bool virtioinput_process_buffer_statusq(virtioinput_state_t* /*vinput*/, const s
         /* send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */ \
         if (!(ram[queue->QueueAvail] & 1)) \
             vinput->InterruptStatus |= VIRTIO_INT__USED_RING; \
+        virtioinput_process_buffer_##NAME_SUFFIX##_post(vinput, available); \
     }
 
 __VINPUT_GENERATE_QUEUE_HANDLER(eventq, __VINPUT_QUEUE_EVENT, true)
@@ -1504,6 +1528,12 @@ void virtioinput_update_config_area(virtioinput_state_t *vinput) {
         const char* name = "Virtual console events";
         ca->size = strlen(name);
         memcpy(ca->u.string, name, ca->size);
+    } else if (ca->select == VIRTIO_INPUT_CFG_EV_BITS && ca->subsel == EV_SYN) {
+        ca->u.bitmap[0] = (1<<SYN_REPORT) | (1<<SYN_DROPPED);
+        ca->size = 1;
+    } else if (ca->select == VIRTIO_INPUT_CFG_EV_BITS && ca->subsel == EV_KEY) {
+        memset(ca->u.bitmap, 0xFF, sizeof(ca->u.bitmap));
+        ca->size = sizeof(ca->u.bitmap);
     } else {
         ca->size = 0;
     }
@@ -1871,6 +1901,7 @@ void handle_sbi_ecall(core_t* core) {
 typedef struct {
     struct pollfd *pfd;
     bool stop_requested;
+    emu_state_t *data;
 } io_thread_handler_data_t;
 
 static void io_thread_handler(uint8_t event, void *__arg);
@@ -1903,6 +1934,11 @@ static void io_console_new_scanout_size(void* __data) {
     spsc_queue_write(&data->io2main, IO_EVENT_VGPU_NEW_SCANOUT_SIZE);
     spsc_queue_commit(&data->io2main);
 }
+static void io_console_pending_input_events(void* __data) {
+    emu_state_t *data = (emu_state_t *) __data;
+    spsc_queue_write(&data->io2main, IO_EVENT_VINPUT);
+    spsc_queue_commit(&data->io2main);
+}
 #endif
 
 void *io_thread(void *__arg) {
@@ -1919,8 +1955,10 @@ void *io_thread(void *__arg) {
     console_set_cb_data(data->console, data);
     console_set_stop_cb(data->console, io_console_stop);
     console_set_new_scanout_size_cb(data->console, io_console_new_scanout_size);
+    console_set_pending_input_events_cb(data->console, io_console_pending_input_events);
     pfd[4].fd = console_get_poll_fd(data->console);
     console_make_current(data->console);
+    console_listen_input_events(data->console);
 #endif
 
     while (1) {
@@ -1928,7 +1966,7 @@ void *io_thread(void *__arg) {
 
         if (pfd[0].revents & POLLIN) {
             read_eventfd(pfd[0].fd);
-            io_thread_handler_data_t hdata = { pfd, false };
+            io_thread_handler_data_t hdata = { pfd, false, data };
             spsc_queue_read_all(&data->main2io, io_thread_handler, &hdata);
             if (hdata.stop_requested)
                 break;
@@ -1956,6 +1994,11 @@ void io_thread_handler(uint8_t event, void *__arg) {
             hdata->stop_requested = true;
             break;
         __IO_THREAD_EVENTS(__IO_THREAD_HANDLE_EVENT_BACK)
+#ifdef USE_VIRGLRENDERER
+        case IO_EVENT_VINPUT:
+            console_listen_input_events(hdata->data->console);
+            break;
+#endif
         default:
             abort();
     }
@@ -2043,6 +2086,11 @@ void main_io_handler(uint8_t event, void *__arg) {
             data->gpu.InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
             emulator_update_vgpu_interrupts(core);
             break;
+        case IO_EVENT_VINPUT:
+            data->vinput.events_pending = true;
+            __virtioinput_try_eventq(&data->vinput);
+            emulator_update_vinput_interrupts(core);
+            break;
 #endif
         default:
             abort();
@@ -2129,7 +2177,7 @@ int main() {
     core.wfi = wfi;
 
 #ifdef USE_VIRGLRENDERER
-    data.console = data.gpu.console = console_new();
+    data.console = data.gpu.console = data.vinput.console = console_new();
 #endif
 
     // set up RAM
@@ -2185,7 +2233,8 @@ int main() {
     virtiogpu_init_scanout(&data.gpu);
     console_get_scanout_size(data.console, &data.gpu.scanout_size);
     data.vinput.ram = data.ram;
-    data.vinput.cookie = &data;
+    data.vinput.main2io = &data.main2io;
+    data.vinput.main2io_event = IO_EVENT_VINPUT;
 #endif
 
     // start I/O thread
