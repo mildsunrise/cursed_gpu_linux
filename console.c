@@ -881,6 +881,12 @@ static void init_gl(console_t* con) {
     check_gl_error("glBindVertexArray");
 
     con->do_draw_frames = true;
+
+    // work around a bug in wayland-egl where a resize won't
+    // take effect if no buffers have been allocated yet...
+    eglSwapBuffers(con->egl_display, con->egl_surface);
+    check_egl_error("eglSwapBuffers");
+
     draw_frame(con);
 }
 
