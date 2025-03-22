@@ -137,6 +137,8 @@ packets can flow and the guest is happy (newer Linux versions print repeated war
 sudo ip link set tap0 up
 ~~~
 
+A hardcoded MAC of 52:41:0c:04:e1:35 is currently advertised to the guest.
+
 ### Virtual GPU
 
 This emulator now exposes a virtual GPU to the guest, which means it depends on EGL/OpenGL.

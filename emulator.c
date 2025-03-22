@@ -297,8 +297,12 @@ typedef struct {
 } virtionet_queue_t;
 
 const uint32_t virtionet_features [] = {
-    0,
+    (1 << VIRTIO_NET_F_MAC),
     1, // VIRTIO_F_VERSION_1
+};
+
+const struct virtio_net_config virtionet_config = {
+    .mac = { 0x52,0x41,0x0c,0x04,0xe1,0x35 },
 };
 
 typedef struct {
@@ -561,8 +565,43 @@ void virtionet_notify_queue(virtionet_state_t* vnet, uint32_t queueIdx) {
 
 REG_FUNCTIONS(bool virtionet_reg, (virtionet_state_t *vnet, uint32_t addr), uint32_t, __virtionet_body)
 
+#define __VIRTIONET_MEM_CASE(FUNC, TYPE, CODE) \
+    case (FUNC): \
+    if (unlikely((addr & ((sizeof(TYPE)) - 1)))) { \
+        core_set_exception(core, exc_cause, core->exc_val); \
+        return; \
+    } \
+    { TYPE x; CODE }; break;
+
+#define __VIRTIONET_MEM_CASE_R(FUNC, TYPE) \
+    __VIRTIONET_MEM_CASE(FUNC, TYPE, \
+        memcpy(&x, ((char*)&virtionet_config) + addr, sizeof(TYPE)); *value = x;)
+
+#define __virtionet_config_mem_body(R, W) \
+    if (addr >= sizeof(virtionet_config)) { \
+        core_set_exception(core, R(RISCV_EXC_LOAD_FAULT) W(RISCV_EXC_STORE_FAULT), core->exc_val); \
+        return; \
+    } \
+    const uint32_t exc_cause = R(RISCV_EXC_LOAD_MISALIGN) W(RISCV_EXC_STORE_FAULT); \
+    W((void)value; core_set_exception(core, exc_cause, core->exc_val); return;) \
+    switch (width) { \
+    R( \
+        __VIRTIONET_MEM_CASE_R(RISCV_MEM_LW,  uint32_t) \
+        __VIRTIONET_MEM_CASE_R(RISCV_MEM_LHU, uint16_t) \
+        __VIRTIONET_MEM_CASE_R(RISCV_MEM_LH,  int16_t) \
+        __VIRTIONET_MEM_CASE_R(RISCV_MEM_LBU, uint8_t) \
+        __VIRTIONET_MEM_CASE_R(RISCV_MEM_LB,  int8_t) \
+    ) \
+        default: \
+            core_set_exception(core, RISCV_EXC_ILLEGAL_INSTR, 0); \
+            return; \
+    }
+
+REG_FUNCTIONS(void __virtionet_config_mem, (core_t *core, virtionet_state_t */*vnet*/, uint32_t addr, uint8_t width), uint32_t, __virtionet_config_mem_body)
+
 // we still need a wrapper for memory accesses
 #define __virtionet_wrap_body(R, W) \
+    if (addr >= 64*4) { REG_FUNC(R, W, __virtionet_config_mem)(core, vnet, addr - 64*4, width, value); return; } \
     switch (width) { \
         case R(RISCV_MEM_LW) W(RISCV_MEM_SW): \
             if (!REG_FUNC(R, W, virtionet_reg)(vnet, addr >> 2, value)) \
