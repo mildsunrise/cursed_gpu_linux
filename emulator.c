@@ -2201,6 +2201,8 @@ static void wfi(core_t* core) {
 
 int main() {
     int ret;
+    const char* env_kernel = getenv("EMULATOR_KERNEL");
+    const char* env_tap_interface = getenv("EMULATOR_TAP_INTERFACE");
 
     // initialize emulator
     emu_state_t data;
@@ -2228,7 +2230,7 @@ int main() {
     assert(!(((uintptr_t)data.ram) & 0b11));
 
     char* ram_cursor = (char*) data.ram;
-    map_file_into_ram(&ram_cursor, "linux/arch/riscv/boot/Image");
+    map_file_into_ram(&ram_cursor, env_kernel ? env_kernel : "linux/arch/riscv/boot/Image");
     // load at last MB to prevent kernel / initrd from overwriting it
     uint32_t dtb_addr = RAM_SIZE - 1024 * 1024;
     memcpy(((char*)data.ram) + dtb_addr, emulator_dtb, sizeof(emulator_dtb));
@@ -2254,8 +2256,8 @@ int main() {
     memset(&ifreq, 0, sizeof(ifreq));
     // iproute2 sets PI, let's make it easier for folks who want to use persistent taps
     ifreq.ifr_flags = IFF_TAP | IFF_NO_PI;
-    strncpy(ifreq.ifr_name, TAP_INTERFACE, sizeof(ifreq.ifr_name));
-    __checkerrno(ioctl(data.vnet.tap_fd, TUNSETIFF, &ifreq) < 0, "TUNSETIFF");
+    strncpy(ifreq.ifr_name, env_tap_interface ? env_tap_interface : TAP_INTERFACE, sizeof(ifreq.ifr_name));
+    __checkerrno(ioctl(data.vnet.tap_fd, TUNSETIFF, &ifreq) < 0, "TUNSETIFF on interface %s", ifreq.ifr_name);
     fprintf(stderr, "allocated TAP interface: %s\n", ifreq.ifr_name);
     assert(fcntl(data.vnet.tap_fd, F_SETFL, fcntl(data.vnet.tap_fd, F_GETFL, 0) | O_NONBLOCK) >= 0);
     data.vnet.ram = data.ram;

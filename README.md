@@ -105,6 +105,8 @@ sudo -E ./emulator
 The path to the kernel is hardcoded in `emulator.c`, change it if needed.
 You should see the Linux UART output appear on stdout, and emulator messages will be printed to stderr.
 
+To use the emulator with a different kernel, set the `EMULATOR_KERNEL` environment variable.
+
 ### Virtual UART
 
 To properly interact with the UART, you can expose the emulator's stdin/stdout on a socket with socat:
@@ -122,8 +124,8 @@ minicom -D unix#emulator-console
 ### Virtual network
 
 The emulator exposes a virtual network interface to the guest, backed by a TAP interface in the host.
-This cannot be disabled; the emulator will attempt to open a `tap0` interface (the name is also hardcoded,
-see `TAP_INTERFACE` in `emulator.c`) so if you wish to run the emulator without elevated privileges,
+This cannot be disabled; the emulator will attempt to open a `tap0` interface (this can be customized with
+`EMULATOR_TAP_INTERFACE`) so if you wish to run the emulator without elevated privileges,
 you'll need to create the TAP interface beforehand with appropriate ownership:
 
 ~~~ bash
